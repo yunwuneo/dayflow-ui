@@ -1,0 +1,110 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, rm, readdir } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { Pool } from 'pg';
+import sharp from 'sharp';
+import { createApp, todayInZone } from '../server/app.ts';
+import { digest } from '../server/security.ts';
+
+test('Dayflow day boundary respects local calendar and DST', () => {
+  assert.equal(todayInZone('Asia/Shanghai', 4, new Date('2026-09-16T19:59:00Z')), '2026-09-16');
+  assert.equal(todayInZone('Asia/Shanghai', 4, new Date('2026-09-16T20:00:00Z')), '2026-09-17');
+  assert.equal(todayInZone('America/New_York', 4, new Date('2026-03-08T07:30:00Z')), '2026-03-07');
+});
+
+test('Authenticated sync, reconciliation, archive and screenshot lifecycle', async t => {
+  assert.ok(process.env.DATABASE_URL, 'DATABASE_URL is required');
+  const admin = new Pool({ connectionString: process.env.DATABASE_URL });
+  const schema = `test_${randomUUID().replaceAll('-', '')}`;
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  const url = new URL(process.env.DATABASE_URL!); url.searchParams.set('options', `-c search_path=${schema}`);
+  const storage = await mkdtemp(path.join(tmpdir(), 'dayflow-tests-'));
+  const config = { databaseUrl: url.toString(), storageDir: storage, adminUsername: 'test', adminPassword: 'a-long-test-password',
+    syncToken: 's'.repeat(48), readToken: 'r'.repeat(48), publicOrigin: 'http://127.0.0.1:4310', production: false, trustProxy: false, logger: false };
+  const app = await createApp(config);
+  t.after(async () => { await app.close(); await admin.query(`DROP SCHEMA ${schema} CASCADE`); await admin.end(); await rm(storage, { recursive: true, force: true }); });
+  const device = randomUUID(); const day = '2026-09-16';
+  const syncHeaders = { authorization: `Bearer ${config.syncToken}` };
+  const readHeaders = { authorization: `Bearer ${config.readToken}` };
+  const card = { record_id: 42, title: '设计同步服务', category: '编程', start: `${day}T09:00:00+08:00`, end: `${day}T10:00:00+08:00`,
+    summary: '完成 Dayflow 接入', detailed_summary: '中文全文检索详情 100%_complete', subcategory: '', apps: ['Terminal'], duration_minutes: 60 };
+  const base = { device_id: device, device_name: 'Test Mac', expected_revision: 0, batch_id: randomUUID(), time_zone: 'Asia/Shanghai', day_boundary_hour: 4,
+    status: { last_capture_at: card.end, pending_batches: 0 }, categories: [{ name: '编程', color_hex: '#449977', is_idle: false, is_system: false }],
+    days: [{ date: day, source_hash: digest('source-v1'), active_ids: [42], activities: [{ content_hash: digest(JSON.stringify(card)), data: card }] }],
+    dailies: [{ date: day, source_hash: digest('daily'), document: { date: day, highlights: ['完成同步'], tasks: [], blockers: '' } }], weeks: [] };
+
+  await t.test('No unauthenticated data or screenshots; separate token scopes', async () => {
+    assert.equal((await app.inject('/api/v1/overview')).statusCode, 401);
+    assert.equal((await app.inject(`/api/v1/activities/${device}/42/screenshot`)).statusCode, 401);
+    assert.equal((await app.inject({ url: '/api/v1/overview', headers: syncHeaders })).statusCode, 401);
+    assert.equal((await app.inject({ url: `/api/v1/sync/state?device_id=${device}`, headers: readHeaders })).statusCode, 401);
+  });
+  let session = '';
+  await t.test('Login requires CSRF header and trusted origin; cookie is HttpOnly', async () => {
+    const payload = { username: 'test', password: config.adminPassword };
+    assert.equal((await app.inject({ method: 'POST', url: '/api/v1/auth/login', payload })).statusCode, 403);
+    assert.equal((await app.inject({ method: 'POST', url: '/api/v1/auth/login', payload, headers: { 'x-dayflow-request': '1', origin: 'https://attacker.example' } })).statusCode, 403);
+    const response = await app.inject({ method: 'POST', url: '/api/v1/auth/login', payload, headers: { 'x-dayflow-request': '1', origin: config.publicOrigin } });
+    assert.equal(response.statusCode, 200);
+    const cookie = String(response.headers['set-cookie']); assert.match(cookie, /HttpOnly/); assert.match(cookie, /SameSite=Strict/);
+    session = cookie.split(';')[0];
+    assert.equal((await app.inject({ url: '/api/v1/overview', headers: { cookie: session } })).statusCode, 200);
+  });
+  await t.test('First batch and replay are idempotent; old revisions conflict', async () => {
+    const response = await app.inject({ method: 'POST', url: '/api/v1/sync/batch', headers: syncHeaders, payload: base });
+    assert.equal(response.statusCode, 200, response.body); assert.equal(response.json().revision, 1);
+    const replay = await app.inject({ method: 'POST', url: '/api/v1/sync/batch', headers: syncHeaders, payload: base });
+    assert.equal(replay.json().replayed, true);
+    const conflict = await app.inject({ method: 'POST', url: '/api/v1/sync/batch', headers: syncHeaders, payload: { ...base, batch_id: randomUUID() } });
+    assert.equal(conflict.statusCode, 409);
+    const activities = (await app.inject({ url: `/api/v1/activities?date=${day}`, headers: readHeaders })).json();
+    assert.equal(activities.total, 1);
+  });
+  await t.test('Missing active records roll back the entire batch', async () => {
+    const invalid = { ...base, batch_id: randomUUID(), expected_revision: 1, days: [{ ...base.days[0], active_ids: [42, 999], activities: [] }] };
+    const response = await app.inject({ method: 'POST', url: '/api/v1/sync/batch', headers: syncHeaders, payload: invalid });
+    assert.equal(response.statusCode, 400);
+    assert.equal((await app.inject({ url: `/api/v1/sync/state?device_id=${device}`, headers: syncHeaders })).json().revision, 1);
+  });
+  await t.test('Screenshot is decoded, protected, and retained once', async () => {
+    const route = `/api/v1/sync/activities/${device}/42/screenshot`;
+    const invalid = await app.inject({ method: 'PUT', url: route, headers: { ...syncHeaders, 'content-type': 'image/jpeg' }, payload: Buffer.from('bad') });
+    assert.equal(invalid.statusCode, 400);
+    const image = await sharp({ create: { width: 32, height: 24, channels: 3, background: '#558866' } }).jpeg().toBuffer();
+    assert.equal((await app.inject({ method: 'PUT', url: route, headers: { ...syncHeaders, 'content-type': 'image/jpeg' }, payload: image })).statusCode, 200);
+    const read = await app.inject({ url: `/api/v1/activities/${device}/42/screenshot`, headers: { cookie: session } });
+    assert.equal(read.statusCode, 200); assert.match(String(read.headers['content-type']), /image\/jpeg/);
+    await app.inject({ method: 'PUT', url: route, headers: { ...syncHeaders, 'content-type': 'image/jpeg' }, payload: image });
+    assert.equal((await readdir(storage)).length, 1);
+  });
+  await t.test('Only changed content is upserted; unchanged day can carry no cards', async () => {
+    const update = { ...base, batch_id: randomUUID(), expected_revision: 1, days: [{ ...base.days[0], activities: [] }], dailies: [] };
+    assert.equal((await app.inject({ method: 'POST', url: '/api/v1/sync/batch', headers: syncHeaders, payload: update })).statusCode, 200);
+    const overview = (await app.inject({ url: `/api/v1/overview?date=${day}`, headers: readHeaders })).json();
+    assert.equal(overview.totals[0].minutes, 60); assert.equal(overview.daily.highlights[0], '完成同步');
+  });
+  await t.test('Source deletion hides active data, keeps archive and screenshot searchable', async () => {
+    const deletion = { ...base, batch_id: randomUUID(), expected_revision: 2, days: [{ date: day, source_hash: digest('empty'), active_ids: [], activities: [] }], dailies: [] };
+    assert.equal((await app.inject({ method: 'POST', url: '/api/v1/sync/batch', headers: syncHeaders, payload: deletion })).statusCode, 200);
+    assert.equal((await app.inject({ url: `/api/v1/activities?date=${day}`, headers: readHeaders })).json().total, 0);
+    const archive = (await app.inject({ url: '/api/v1/activities?q=' + encodeURIComponent('全文检索') + '&include_deleted=true', headers: readHeaders })).json();
+    assert.equal(archive.total, 1); assert.equal(archive.activities[0].source_deleted, true); assert.equal(archive.activities[0].has_screenshot, true);
+    const totals = (await app.inject({ url: `/api/v1/overview?date=${day}`, headers: readHeaders })).json().totals;
+    assert.equal(totals.length, 0);
+    assert.equal((await app.inject({ url: `/api/v1/activities/${device}/42/screenshot`, headers: readHeaders })).statusCode, 200);
+  });
+  await t.test('Search treats wildcard characters literally and validates dates', async () => {
+    const found = (await app.inject({ url: '/api/v1/activities?include_deleted=true&q=' + encodeURIComponent('100%_complete'), headers: readHeaders })).json();
+    assert.equal(found.total, 1);
+    assert.equal((await app.inject({ url: '/api/v1/activities?date=2026-02-30', headers: readHeaders })).statusCode, 400);
+    assert.equal((await app.inject({ url: '/api/v1/activities?page=-1', headers: readHeaders })).statusCode, 400);
+  });
+  await t.test('Logout revokes the session', async () => {
+    const response = await app.inject({ method: 'POST', url: '/api/v1/auth/logout', headers: { cookie: session, 'x-dayflow-request': '1' } });
+    assert.equal(response.statusCode, 200);
+    assert.equal((await app.inject({ url: '/api/v1/overview', headers: { cookie: session } })).statusCode, 401);
+  });
+});

@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.local/
+storage/
+test-results/
+playwright-report/
+macos/.build/
+macos/.swiftpm/
+*.DS_Store

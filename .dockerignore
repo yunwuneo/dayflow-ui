@@ -1,0 +1,10 @@
+node_modules
+.git
+.env
+.env.*
+.local
+storage
+macos
+dist
+test-results
+playwright-report
