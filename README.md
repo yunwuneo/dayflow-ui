@@ -19,6 +19,7 @@
 server/                  Fastify API、PostgreSQL schema、鉴权及同步协议
 web/                     React WebUI
 macos/                   SwiftUI 菜单栏应用及同步引擎
+ios/                     iOS / iPadOS 原生 Liquid Glass 档案客户端
 scripts/                 初始化、构建、密码重置、本地同步
 tests/                   服务端集成测试与浏览器测试
 compose.yaml             PostgreSQL + Node.js + Caddy HTTPS
@@ -86,6 +87,12 @@ DayflowSync --sync-once --config /path/to/settings.json --state-dir /path/to/sta
 ```
 
 配置格式见 `macos/Sources/DayflowSync/Support.swift` 中的 `Settings`，本地示例由 `npm run sync:local` 生成。保留同一设备 ID；更换 ID 会被视为另一台设备。
+
+## iOS 客户端
+
+用 Xcode 26+ 打开 `ios/Dayflow.xcodeproj`，选择 `Dayflow` Scheme，在 iOS / iPadOS 26+ 模拟器或真机运行。输入服务器地址，使用与 Web UI 相同的账号密码或只读 `READ_API_TOKEN` 登录。
+
+支持时间线、分类筛选、中文全文搜索、分页、活动详情、截图缩放、日报、周统计及设备状态；使用原生 SwiftUI 与 Liquid Glass。密码不保存，会话与令牌存入钥匙串。运行、签名和测试说明见 [ios/README.md](ios/README.md)。
 
 ## 云服务器部署
 

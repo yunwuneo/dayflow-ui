@@ -10,3 +10,6 @@ playwright-report/
 macos/.build/
 macos/.swiftpm/
 *.DS_Store
+ios/build/
+ios/*.xcresult/
+ios/**/xcuserdata/
