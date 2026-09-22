@@ -135,6 +135,9 @@ docker compose --env-file .env.production exec -T app tar -C /app/storage -czf -
 | `POST /auth/login` | `{ username, password }`，需要 `X-Dayflow-Request: 1` |
 | `POST /auth/logout` | 注销并撤销会话，需要相同校验头 |
 | `GET /auth/session` | 当前登录状态 |
+| `GET /auth/casdoor/start` | 跳转 Casdoor OAuth 授权 |
+| `GET /auth/casdoor/callback` | 接收 Casdoor 授权回调；已绑定账号直接建立会话 |
+| `POST /auth/casdoor/bind` | 用已有 Dayflow 账号完成一次性 Casdoor 绑定 |
 | `GET /overview?date=YYYY-MM-DD` | 日期列表、当天汇总、日报、周统计和设备状态 |
 | `GET /activities` | `date` / `from` / `to` / `q` / `category` / `include_deleted` / `page` / `limit` |
 | `GET /activities/:device/:record` | 完整活动 |
@@ -144,6 +147,8 @@ docker compose --env-file .env.production exec -T app tar -C /app/storage -czf -
 | `PUT /sync/activities/:device/:record/screenshot` | `Content-Type: image/jpeg`，最大 3 MB |
 
 API 日期与时间按照源设备时区和 Dayflow 的日界线处理；默认凌晨 4 点。日报和周统计展示 Dayflow 自己生成的数据，因此可能比刚产生的活动晚。搜索在标题、摘要、详细记录和应用字段中进行，支持中文与普通子串，不依赖英语分词。
+
+Casdoor 登录通过 `CASDOOR_ORIGIN`、`CASDOOR_CLIENT_ID`、`CASDOOR_CLIENT_SECRET` 和可选的 `CASDOOR_REDIRECT_URI` 配置。首次登录不会创建 Dayflow 用户，必须用已有 Dayflow 账号密码完成一次绑定；绑定关系写入 `casdoor_accounts`，同一个 Dayflow 账号不能绑定第二个 Casdoor 身份。
 
 ## 一致性与边界
 

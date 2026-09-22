@@ -71,7 +71,7 @@ export async function createApp(config: Config) {
       const origin = request.headers.origin;
       if (origin && origin !== config.publicOrigin) throw failure(403, '请求来源不受信任');
     }
-    if (url === '/api/v1/auth/login') return;
+    if (['/api/v1/auth/login', '/api/v1/auth/casdoor/start', '/api/v1/auth/casdoor/callback', '/api/v1/auth/casdoor/config', '/api/v1/auth/casdoor/pending', '/api/v1/auth/casdoor/bind'].includes(url)) return;
     if (['GET', 'HEAD'].includes(request.method) && config.readToken && bearer && constantEquals(bearer, config.readToken)) return;
     const token = request.cookies.dayflow_session;
     if (!token) throw failure(401, '请先登录');
@@ -80,16 +80,81 @@ export async function createApp(config: Config) {
   });
 
   app.get('/health', async () => { await pool.query('SELECT 1'); return { ok: true }; });
-  app.post('/api/v1/auth/login', { config: { rateLimit: { max: 8, timeWindow: '1 minute' } } }, async (request, reply) => {
-    const { username, password } = z.object({ username: z.string().max(200), password: z.string().max(1000) }).parse(request.body);
-    const result = await pool.query('SELECT password_hash FROM users WHERE username=$1', [username]);
-    const valid = await verifyPassword(password, result.rows[0]?.password_hash || dummyHash);
-    if (!valid || !result.rowCount) throw failure(401, '用户名或密码不正确');
+  const establishSession = async (username: string, reply: any) => {
     const token = randomBytes(32).toString('hex');
     await pool.query('DELETE FROM sessions WHERE expires_at < now()');
     await pool.query("INSERT INTO sessions VALUES($1,$2,now()+interval '7 days')", [digest(token), username]);
     reply.setCookie('dayflow_session', token, { httpOnly: true, secure: config.production, sameSite: 'strict', path: '/', maxAge: 604800 });
     return { username };
+  };
+  app.post('/api/v1/auth/login', { config: { rateLimit: { max: 8, timeWindow: '1 minute' } } }, async (request, reply) => {
+    const { username, password } = z.object({ username: z.string().max(200), password: z.string().max(1000) }).parse(request.body);
+    const result = await pool.query('SELECT password_hash FROM users WHERE username=$1', [username]);
+    const valid = await verifyPassword(password, result.rows[0]?.password_hash || dummyHash);
+    if (!valid || !result.rowCount) throw failure(401, '用户名或密码不正确');
+    return establishSession(username, reply);
+  });
+  app.get('/api/v1/auth/casdoor/config', async () => ({ enabled: Boolean(config.casdoor) }));
+  app.get('/api/v1/auth/casdoor/start', async (_request, reply) => {
+    if (!config.casdoor) throw failure(503, 'Casdoor 登录尚未配置');
+    const state = randomBytes(32).toString('hex');
+    reply.setCookie('casdoor_oauth_state', state, { httpOnly: true, secure: config.production, sameSite: 'lax', path: '/', maxAge: 600 });
+    const authorize = new URL('/login/oauth/authorize', config.casdoor.origin);
+    authorize.search = new URLSearchParams({ client_id: config.casdoor.clientId, response_type: 'code', redirect_uri: config.casdoor.redirectUri, scope: 'openid profile email', state }).toString();
+    return reply.redirect(authorize.toString());
+  });
+  app.get('/api/v1/auth/casdoor/callback', async (request, reply) => {
+    if (!config.casdoor) throw failure(503, 'Casdoor 登录尚未配置');
+    const query = z.object({ code: z.string().min(1).optional(), state: z.string().min(1).optional(), error: z.string().optional() }).parse(request.query);
+    const state = request.cookies.casdoor_oauth_state;
+    reply.clearCookie('casdoor_oauth_state', { path: '/' });
+    if (query.error) throw failure(401, 'Casdoor 登录已取消');
+    if (!query.code || !query.state || !state || !constantEquals(query.state, state)) throw failure(400, 'Casdoor 登录状态无效');
+    const tokenResponse = await fetch(new URL('/api/login/oauth/access_token', config.casdoor.origin), {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+      body: new URLSearchParams({ grant_type: 'authorization_code', client_id: config.casdoor.clientId, client_secret: config.casdoor.clientSecret, code: query.code, redirect_uri: config.casdoor.redirectUri }),
+    });
+    if (!tokenResponse.ok) throw failure(502, 'Casdoor 令牌交换失败');
+    const token = await tokenResponse.json() as { access_token?: string };
+    if (!token.access_token) throw failure(502, 'Casdoor 未返回访问令牌');
+    const userResponse = await fetch(new URL('/api/userinfo', config.casdoor.origin), { headers: { authorization: `Bearer ${token.access_token}`, accept: 'application/json' } });
+    if (!userResponse.ok) throw failure(502, 'Casdoor 用户信息获取失败');
+    const profile = await userResponse.json() as Record<string, unknown>;
+    const subject = String(profile.sub ?? profile.id ?? profile.name ?? '').trim();
+    if (!subject) throw failure(502, 'Casdoor 用户信息缺少稳定身份标识');
+    const linked = await pool.query('SELECT username FROM casdoor_accounts WHERE subject=$1', [subject]);
+    if (linked.rowCount) { await establishSession(linked.rows[0].username, reply); return reply.redirect('/'); }
+    const pending = randomBytes(32).toString('hex');
+    await pool.query('DELETE FROM casdoor_link_intents WHERE expires_at < now()');
+    await pool.query("INSERT INTO casdoor_link_intents(token_hash,subject,profile,expires_at) VALUES($1,$2,$3,now()+interval '10 minutes')", [digest(pending), subject, JSON.stringify({ displayName: profile.displayName, email: profile.email })]);
+    reply.setCookie('casdoor_pending', pending, { httpOnly: true, secure: config.production, sameSite: 'lax', path: '/', maxAge: 600 });
+    return reply.redirect('/?casdoor=bind');
+  });
+  app.get('/api/v1/auth/casdoor/pending', async request => {
+    const pending = request.cookies.casdoor_pending;
+    if (!pending) throw failure(401, '没有待绑定的 Casdoor 身份');
+    const result = await pool.query('SELECT profile FROM casdoor_link_intents WHERE token_hash=$1 AND expires_at>now()', [digest(pending)]);
+    if (!result.rowCount) throw failure(401, 'Casdoor 绑定已过期');
+    return { displayName: result.rows[0].profile?.displayName || '', email: result.rows[0].profile?.email || '' };
+  });
+  app.post('/api/v1/auth/casdoor/bind', { config: { rateLimit: { max: 8, timeWindow: '1 minute' } } }, async (request, reply) => {
+    const pending = request.cookies.casdoor_pending;
+    if (!pending) throw failure(401, '没有待绑定的 Casdoor 身份');
+    const { username, password } = z.object({ username: z.string().max(200), password: z.string().max(1000) }).parse(request.body);
+    const intent = await pool.query('SELECT subject FROM casdoor_link_intents WHERE token_hash=$1 AND expires_at>now()', [digest(pending)]);
+    if (!intent.rowCount) throw failure(401, 'Casdoor 绑定已过期');
+    const user = await pool.query('SELECT password_hash FROM users WHERE username=$1', [username]);
+    const valid = await verifyPassword(password, user.rows[0]?.password_hash || dummyHash);
+    if (!valid || !user.rowCount) throw failure(401, 'Dayflow 用户名或密码不正确');
+    try {
+      await pool.query('INSERT INTO casdoor_accounts(subject,username) VALUES($1,$2)', [intent.rows[0].subject, username]);
+    } catch (error) {
+      if ((error as { code?: string }).code === '23505') throw failure(409, '该 Dayflow 账号或 Casdoor 身份已完成绑定');
+      throw error;
+    }
+    await pool.query('DELETE FROM casdoor_link_intents WHERE token_hash=$1', [digest(pending)]);
+    reply.clearCookie('casdoor_pending', { path: '/' });
+    return establishSession(username, reply);
   });
   app.get('/api/v1/auth/session', async () => ({ username: config.adminUsername }));
   app.post('/api/v1/auth/logout', async (request, reply) => {

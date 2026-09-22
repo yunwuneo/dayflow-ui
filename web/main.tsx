@@ -5,6 +5,7 @@ import { Activity as ActivityIcon, ArrowLeft, ArrowRight, CalendarDays, Check, C
   Menu, Search, SlidersHorizontal, Sun, X, RefreshCw, ShieldCheck, Monitor, BarChart3, AlertCircle } from 'lucide-react';
 import { api, Activity, Overview, screenshotURL } from './api';
 import './style.css';
+import './casdoor.css';
 
 const duration = (minutes: number) => minutes >= 60 ? `${Math.floor(minutes / 60)}小时${Math.round(minutes % 60) ? ` ${Math.round(minutes % 60)}分` : ''}` : `${Math.round(minutes)}分钟`;
 const shiftDate = (date: string, offset: number) => { const d = new Date(`${date}T12:00:00Z`); d.setUTCDate(d.getUTCDate() + offset); return d.toISOString().slice(0, 10); };
@@ -19,6 +20,8 @@ function Empty({ text, icon: Icon = CalendarDays }: { text: string; icon?: typeo
 function App() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [initialError, setInitialError] = useState('');
+  const [casdoorEnabled, setCasdoorEnabled] = useState(false);
+  const casdoorBinding = new URLSearchParams(location.search).get('casdoor') === 'bind';
   const checkSession = () => { setInitialError(''); api('/auth/session').then(() => setAuthenticated(true)).catch(e => {
     if (e.status === 401) setAuthenticated(false); else setInitialError(e.message);
   }); };
@@ -27,14 +30,17 @@ function App() {
     window.addEventListener('session-expired', handler);
     return () => window.removeEventListener('session-expired', handler);
   }, []);
+  useEffect(() => { if (authenticated === false) api<{ enabled: boolean }>('/auth/casdoor/config').then(result => setCasdoorEnabled(result.enabled)).catch(() => setCasdoorEnabled(false)); }, [authenticated]);
   if (initialError) return <div className="login-shell"><AlertCircle /><p>{initialError}</p><button onClick={checkSession}>重新连接</button></div>;
   if (authenticated === null) return <div className="app-loading"><LoaderCircle className="spin" /><span>正在连接</span></div>;
-  return authenticated ? <Workspace onLogout={async () => { await api('/auth/logout', { method: 'POST' }); setAuthenticated(false); }} /> : <Login onSuccess={() => setAuthenticated(true)} />;
+  if (authenticated) return <Workspace onLogout={async () => { await api('/auth/logout', { method: 'POST' }); setAuthenticated(false); }} />;
+  return casdoorBinding ? <CasdoorBind onSuccess={() => { history.replaceState(null, '', '/'); setAuthenticated(true); }} /> : <Login casdoorEnabled={casdoorEnabled} onSuccess={() => setAuthenticated(true)} />;
 }
-function Login({ onSuccess }: { onSuccess: () => void }) {
+function Login({ casdoorEnabled, onSuccess }: { casdoorEnabled: boolean; onSuccess: () => void }) {
   const [username, setUsername] = useState('neo'); const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false); const [error, setError] = useState('');
   return <main className="login-shell"><div className="brand-mark large"><Sun size={30} /></div><h1>Dayflow Archive</h1>
+    {casdoorEnabled && <><a className="primary full casdoor-button" href="/api/v1/auth/casdoor/start"><ShieldCheck size={17} />使用 Casdoor 登录</a><div className="login-divider">或使用 Dayflow 账号</div></>}
     <form onSubmit={async event => { event.preventDefault(); setBusy(true); setError('');
       try { await api('/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }); onSuccess(); }
       catch (e) { setError((e as Error).message); } finally { setBusy(false); }
@@ -45,6 +51,22 @@ function Login({ onSuccess }: { onSuccess: () => void }) {
       {error && <p className="error" role="alert">{error}</p>}
       <button className="primary full" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <ArrowRight size={17} />}登录</button>
     </form><span className="login-footer"><ShieldCheck size={14} />个人活动档案</span>
+  </main>;
+}
+function CasdoorBind({ onSuccess }: { onSuccess: () => void }) {
+  const [username, setUsername] = useState('neo'); const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false); const [error, setError] = useState('');
+  return <main className="login-shell"><div className="brand-mark large"><ShieldCheck size={30} /></div><h1>绑定 Casdoor</h1>
+    <form onSubmit={async event => { event.preventDefault(); setBusy(true); setError('');
+      try { await api('/auth/casdoor/bind', { method: 'POST', body: JSON.stringify({ username, password }) }); onSuccess(); }
+      catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+    }}>
+      <h2>绑定已有 Dayflow 账号</h2><p className="bind-note">此操作只需完成一次。请输入已有 Dayflow 账号确认身份，不会创建新账号。</p>
+      <label>用户名<input autoComplete="username" required value={username} onChange={e => setUsername(e.target.value)} /></label>
+      <label>密码<input autoComplete="current-password" type="password" required value={password} onChange={e => setPassword(e.target.value)} /></label>
+      {error && <p className="error" role="alert">{error}</p>}
+      <button className="primary full" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <ArrowRight size={17} />}确认绑定</button>
+    </form><span className="login-footer"><ShieldCheck size={14} />仅绑定已有账号</span>
   </main>;
 }
 function Workspace({ onLogout }: { onLogout: () => Promise<void> }) {

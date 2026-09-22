@@ -5,6 +5,14 @@ CREATE TABLE IF NOT EXISTS sessions (
   token_hash text PRIMARY KEY, username text NOT NULL REFERENCES users(username),
   expires_at timestamptz NOT NULL
 );
+CREATE TABLE IF NOT EXISTS casdoor_accounts (
+  subject text PRIMARY KEY, username text NOT NULL UNIQUE REFERENCES users(username),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS casdoor_link_intents (
+  token_hash text PRIMARY KEY, subject text NOT NULL, profile jsonb NOT NULL DEFAULT '{}',
+  expires_at timestamptz NOT NULL
+);
 CREATE TABLE IF NOT EXISTS devices (
   id uuid PRIMARY KEY, name text NOT NULL, revision integer NOT NULL DEFAULT 0,
   time_zone text NOT NULL, day_boundary_hour integer NOT NULL DEFAULT 4,
