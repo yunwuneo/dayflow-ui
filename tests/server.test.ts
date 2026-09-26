@@ -86,6 +86,35 @@ test('Authenticated sync, reconciliation, archive and screenshot lifecycle', asy
     const overview = (await app.inject({ url: `/api/v1/overview?date=${day}`, headers: readHeaders })).json();
     assert.equal(overview.totals[0].minutes, 60); assert.equal(overview.daily.highlights[0], '完成同步');
   });
+  await t.test('MCP endpoint accepts only the read token and exposes read-only tools', async () => {
+    const mcpHeaders = { ...readHeaders, accept: 'application/json, text/event-stream' };
+    const rpc = async (method: string, params: object, headers: Record<string, string> = mcpHeaders) =>
+      app.inject({ method: 'POST', url: '/mcp', headers, payload: { jsonrpc: '2.0', id: 1, method, params } });
+    const call = async (name: string, args: object) => (await rpc('tools/call', { name, arguments: args })).json().result;
+    assert.equal((await rpc('tools/list', {}, { accept: mcpHeaders.accept })).statusCode, 401);
+    assert.equal((await rpc('tools/list', {}, { ...syncHeaders, accept: mcpHeaders.accept })).statusCode, 401);
+    assert.equal((await rpc('tools/list', {}, { cookie: session, accept: mcpHeaders.accept })).statusCode, 401);
+    assert.equal((await app.inject({ url: '/mcp', headers: readHeaders })).statusCode, 405);
+    const init = await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } });
+    assert.equal(init.statusCode, 200, init.body); assert.equal(init.json().result.serverInfo.name, 'dayflow');
+    const tools = (await rpc('tools/list', {})).json().result.tools;
+    assert.deepEqual(tools.map((tool: any) => tool.name).sort(), ['get_activity', 'get_overview', 'get_screenshot', 'search_activities', 'summarize_time']);
+    assert.ok(tools.every((tool: any) => tool.annotations.readOnlyHint));
+    const overview = JSON.parse((await call('get_overview', { date: day })).content[0].text);
+    assert.equal(overview.daily.highlights[0], '完成同步');
+    const found = JSON.parse((await call('search_activities', { q: '全文检索' })).content[0].text);
+    assert.equal(found.total, 1); assert.equal(found.activities[0].title, card.title); assert.equal(found.activities[0].detailed_summary, undefined);
+    const detail = JSON.parse((await call('get_activity', { device_id: device, record_id: 42 })).content[0].text);
+    assert.equal(detail.detailed_summary, card.detailed_summary);
+    assert.equal((await call('get_activity', { device_id: device, record_id: 7 })).isError, true);
+    const screenshot = (await call('get_screenshot', { device_id: device, record_id: 42 })).content[0];
+    assert.equal(screenshot.type, 'image'); assert.equal(screenshot.mimeType, 'image/jpeg');
+    assert.ok((await sharp(Buffer.from(screenshot.data, 'base64')).metadata()).width);
+    const summary = JSON.parse((await call('summarize_time', { from: day, to: day, group_by: 'day' })).content[0].text);
+    assert.deepEqual(summary.groups, [{ day, minutes: 60, count: 1 }]);
+    assert.equal((await call('summarize_time', { from: day, to: '2026-09-01' })).isError, true);
+    assert.equal((await call('search_activities', { date: '2026-02-30' })).isError, true);
+  });
   await t.test('Source deletion hides active data, keeps archive and screenshot searchable', async () => {
     const deletion = { ...base, batch_id: randomUUID(), expected_revision: 2, days: [{ date: day, source_hash: digest('empty'), active_ids: [], activities: [] }], dailies: [] };
     assert.equal((await app.inject({ method: 'POST', url: '/api/v1/sync/batch', headers: syncHeaders, payload: deletion })).statusCode, 200);

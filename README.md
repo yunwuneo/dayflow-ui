@@ -150,6 +150,25 @@ API 日期与时间按照源设备时区和 Dayflow 的日界线处理；默认�
 
 Casdoor 登录通过 `CASDOOR_ORIGIN`、`CASDOOR_CLIENT_ID`、`CASDOOR_CLIENT_SECRET` 和可选的 `CASDOOR_REDIRECT_URI` 配置。首次登录不会创建 Dayflow 用户，必须用已有 Dayflow 账号密码完成一次绑定；绑定关系写入 `casdoor_accounts`，同一个 Dayflow 账号不能绑定第二个 Casdoor 身份。
 
+## MCP
+
+配置 `READ_API_TOKEN` 后，`POST /mcp` 提供只读的 MCP 服务（Streamable HTTP，无会话，JSON 响应），供 Claude Code、Cursor 等可自定义请求头的 AI 客户端查询档案。仅接受 `Authorization: Bearer <READ_API_TOKEN>`；会话 Cookie 和 `SYNC_TOKEN` 均会被拒绝。未配置只读令牌时该接口返回 404。每分钟最多 60 次请求。
+
+| 工具 | 用途 |
+| --- | --- |
+| `get_overview` | 同 `GET /overview`：当天分类时长、日报、周统计、设备状态和有数据的日期 |
+| `search_activities` | 同 `GET /activities` 的筛选与分页；结果省略 `detailed_summary` |
+| `get_activity` | 单条活动完整内容 |
+| `get_screenshot` | 活动截图，以图片内容返回 |
+| `summarize_time` | 日期范围内按天或按分类汇总时长，最多 366 天 |
+
+```sh
+claude mcp add --transport http dayflow https://dayflow.example.com/mcp \
+  --header "Authorization: Bearer $READ_API_TOKEN"
+```
+
+截图会发送给所连接的 AI 客户端及其模型服务，接入前请确认可以接受。
+
 ## 一致性与边界
 
 - CLI 没有变更游标，因此客户端每轮只读扫描本地活动元数据，计算日期指纹。这里的“增量”指 CLI 读取范围和网络传输量；不是零扫描的数据库变更订阅。

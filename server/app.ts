@@ -11,27 +11,15 @@ import sharp from 'sharp';
 import { z, ZodError } from 'zod';
 import type { Config } from './config.ts';
 import { batch as batchSchema, date as dateSchema } from './contracts.ts';
+import { registerMcp } from './mcp.ts';
+import { activityFilters, getActivity, getOverview, getScreenshotHash, searchActivities } from './queries.ts';
 import { constantEquals, digest, hashPassword, verifyPassword } from './security.ts';
 
-export function todayInZone(zone: string, boundary: number, now = new Date()) {
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23',
-  }).formatToParts(now);
-  const get = (type: string) => parts.find(p => p.type === type)!.value;
-  const day = new Date(`${get('year')}-${get('month')}-${get('day')}T12:00:00Z`);
-  if (Number(get('hour')) < boundary) day.setUTCDate(day.getUTCDate() - 1);
-  return day.toISOString().slice(0, 10);
-}
-function monday(day: string) {
-  const d = new Date(`${day}T12:00:00Z`);
-  d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
-  return d.toISOString().slice(0, 10);
-}
+export { todayInZone } from './queries.ts';
+
 const failure = (statusCode: number, message: string) => Object.assign(new Error(message), { statusCode });
 const uuidQuery = z.object({ device_id: z.uuid() });
 const activityParams = z.object({ device: z.uuid(), record: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER) });
-const rowActivity = (row: any) => ({ ...row.payload, device_id: row.device_id, day: row.day,
-  source_deleted: row.source_deleted, has_screenshot: Boolean(row.screenshot_hash), updated_at: row.updated_at });
 
 export async function createApp(config: Config) {
   const pool = new Pool({ connectionString: config.databaseUrl, max: 10 });
@@ -58,10 +46,16 @@ export async function createApp(config: Config) {
       .header('X-Frame-Options', 'DENY')
       .header('Content-Security-Policy', "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
     const url = request.routeOptions.url || request.url.split('?')[0];
-    if (!url.startsWith('/api/')) return;
+    if (!url.startsWith('/api/') && url !== '/mcp') return;
     reply.header('Cache-Control', 'no-store');
     const authorization = request.headers.authorization;
     const bearer = authorization?.startsWith('Bearer ') ? authorization.slice(7) : '';
+    // MCP clients are not browsers: only the read token grants access, never a session cookie.
+    if (url === '/mcp') {
+      if (!config.readToken) throw failure(404, '接口不存在');
+      if (!bearer || !constantEquals(bearer, config.readToken)) throw failure(401, '只读令牌无效');
+      return;
+    }
     if (url.startsWith('/api/v1/sync/')) {
       if (!bearer || !constantEquals(bearer, config.syncToken)) throw failure(401, '设备令牌无效');
       return;
@@ -239,59 +233,26 @@ export async function createApp(config: Config) {
 
   app.get('/api/v1/overview', async request => {
     const query = z.object({ date: dateSchema.optional() }).parse(request.query);
-    const devices = (await pool.query('SELECT * FROM devices ORDER BY last_sync_at DESC NULLS LAST')).rows;
-    const primary = devices[0];
-    const today = todayInZone(primary?.time_zone || 'Asia/Shanghai', primary?.day_boundary_hour ?? 4);
-    const day = query.date || today;
-    const [days, totals, docs] = await Promise.all([
-      pool.query('SELECT DISTINCT day::text FROM activities WHERE NOT source_deleted ORDER BY day DESC'),
-      pool.query(`SELECT payload->>'category' AS category, sum((payload->>'duration_minutes')::numeric)::float8 AS minutes,
-        count(*)::integer AS count FROM activities WHERE day=$1 AND NOT source_deleted GROUP BY payload->>'category' ORDER BY minutes DESC`, [day]),
-      pool.query(`SELECT kind,payload FROM documents WHERE device_id=$1 AND ((kind='daily' AND day=$2) OR (kind='weekly' AND day=$3))`, [primary?.id || '00000000-0000-0000-0000-000000000000', day, monday(day)]),
-    ]);
-    return { date: day, today, time_zone: primary?.time_zone || 'Asia/Shanghai', day_boundary_hour: primary?.day_boundary_hour ?? 4,
-      available_days: days.rows.map(r => r.day), devices, categories: primary?.categories || [],
-      totals: totals.rows, daily: docs.rows.find(r => r.kind === 'daily')?.payload || null,
-      weekly: docs.rows.find(r => r.kind === 'weekly')?.payload || null };
+    return getOverview(pool, query.date);
   });
   app.get('/api/v1/activities', async request => {
-    const query = z.object({ date: dateSchema.optional(), from: dateSchema.optional(), to: dateSchema.optional(),
-      q: z.string().max(500).optional(), category: z.string().max(500).optional(),
-      include_deleted: z.enum(['true', 'false']).default('false'),
-      page: z.coerce.number().int().min(1).max(100000).default(1), limit: z.coerce.number().int().min(1).max(100).default(30),
-    }).parse(request.query);
-    const values: unknown[] = []; const clauses = ['TRUE'];
-    const condition = (sql: string, value: unknown) => { values.push(value); clauses.push(sql.replace('?', `$${values.length}`)); };
-    if (query.date) condition('day=?', query.date);
-    if (query.from) condition('day>=?', query.from);
-    if (query.to) condition('day<=?', query.to);
-    if (query.category) condition("payload->>'category'=?", query.category);
-    if (query.include_deleted !== 'true') clauses.push('NOT source_deleted');
-    if (query.q?.trim()) {
-      const escaped = query.q.trim().replace(/[\\%_]/g, '\\$&');
-      condition("concat_ws(' ',payload->>'title',payload->>'summary',payload->>'detailed_summary',payload->>'apps') ILIKE ?", `%${escaped}%`);
-    }
-    const where = clauses.join(' AND ');
-    const total = await pool.query(`SELECT count(*)::integer AS total FROM activities WHERE ${where}`, values);
-    values.push(query.limit, (query.page - 1) * query.limit);
-    const result = await pool.query(`SELECT *,day::text FROM activities WHERE ${where}
-      ORDER BY start_at ${query.date ? 'ASC' : 'DESC'},record_id ASC LIMIT $${values.length - 1} OFFSET $${values.length}`, values);
-    return { activities: result.rows.map(rowActivity), total: total.rows[0].total, page: query.page, limit: query.limit };
+    const query = z.object({ ...activityFilters, include_deleted: z.enum(['true', 'false']).default('false') }).parse(request.query);
+    return searchActivities(pool, { ...query, include_deleted: query.include_deleted === 'true' });
   });
   app.get('/api/v1/activities/:device/:record', async request => {
     const { device, record } = activityParams.parse(request.params);
-    const result = await pool.query('SELECT *,day::text FROM activities WHERE device_id=$1 AND record_id=$2', [device, record]);
-    if (!result.rowCount) throw failure(404, '活动不存在');
-    return rowActivity(result.rows[0]);
+    const activity = await getActivity(pool, device, record);
+    if (!activity) throw failure(404, '活动不存在');
+    return activity;
   });
   app.get('/api/v1/activities/:device/:record/screenshot', async (request, reply) => {
     const { device, record } = activityParams.parse(request.params);
-    const result = await pool.query('SELECT screenshot_hash FROM activities WHERE device_id=$1 AND record_id=$2', [device, record]);
-    const hash = result.rows[0]?.screenshot_hash;
+    const hash = await getScreenshotHash(pool, device, record);
     if (!hash) throw failure(404, '截图尚未同步');
     try { return reply.type('image/jpeg').header('Cache-Control', 'private, max-age=300').send(await readFile(path.join(config.storageDir, `${hash}.jpg`))); }
     catch { throw failure(404, '截图文件不可用'); }
   });
+  registerMcp(app, pool, config);
 
   const webRoot = path.resolve('dist/web');
   if (existsSync(webRoot)) {
