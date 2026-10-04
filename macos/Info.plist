@@ -11,5 +11,11 @@
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
-  <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <!-- User-configured HTTP IP addresses require this exception. Settings.validatedURL()
+         enforces the HTTP allowlist before syncing, and NoRedirect blocks redirects.
+         Do not add NSAllowsLocalNetworking: its presence overrides NSAllowsArbitraryLoads. -->
+    <key>NSAllowsArbitraryLoads</key><true/>
+  </dict>
 </dict></plist>

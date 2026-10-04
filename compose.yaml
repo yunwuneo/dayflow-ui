@@ -13,6 +13,13 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+  storage-init:
+    build: .
+    user: root
+    command: [sh, -c, 'chown node:node /app/storage && chmod u+rwx /app/storage']
+    volumes:
+      - screenshots:/app/storage
+    restart: 'no'
   app:
     build: .
     restart: unless-stopped
@@ -37,6 +44,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
     healthcheck:
       test: [CMD, node, -e, "fetch('http://127.0.0.1:4310/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s

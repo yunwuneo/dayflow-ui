@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, rm, readdir } from 'node:fs/promises';
+import { chmod, mkdtemp, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Pool } from 'pg';
@@ -102,6 +102,28 @@ test('Authenticated sync, reconciliation, archive and screenshot lifecycle', asy
     const response = await app.inject({ method: 'POST', url: '/api/v1/sync/batch', headers: syncHeaders, payload: invalid });
     assert.equal(response.statusCode, 400);
     assert.equal((await app.inject({ url: `/api/v1/sync/state?device_id=${device}`, headers: syncHeaders })).json().revision, 1);
+  });
+  await t.test('Startup rejects an existing unwritable screenshot directory', { skip: process.getuid?.() === 0 }, async () => {
+    await chmod(storage, 0o500);
+    try {
+      await assert.rejects(createApp(config), /截图存储目录不可写.*EACCES/);
+    } finally { await chmod(storage, 0o700); }
+    assert.equal((await readdir(storage)).length, 0, 'Storage checks must not leave probe files');
+  });
+  await t.test('Unwritable screenshot storage reports the cause and leaves uploads retryable', { skip: process.getuid?.() === 0 }, async () => {
+    const image = await sharp({ create: { width: 32, height: 24, channels: 3, background: '#558866' } }).jpeg().toBuffer();
+    await chmod(storage, 0o500);
+    try {
+      const response = await app.inject({ method: 'PUT', url: `/api/v1/sync/activities/${device}/42/screenshot`,
+        headers: { ...syncHeaders, 'content-type': 'image/jpeg' }, payload: image });
+      assert.equal(response.statusCode, 503, response.body);
+      assert.match(response.json().error, /截图存储目录不可写/);
+      assert.match(response.json().error, /EACCES/);
+      assert.ok(!response.body.includes(storage), 'Do not expose server filesystem paths');
+      const state = (await app.inject({ url: `/api/v1/sync/state?device_id=${device}`, headers: syncHeaders })).json();
+      assert.equal(state.activities[0].has_screenshot, false);
+      assert.equal((await readdir(storage)).length, 0);
+    } finally { await chmod(storage, 0o700); }
   });
   await t.test('Screenshot is decoded, protected, and retained once', async () => {
     const route = `/api/v1/sync/activities/${device}/42/screenshot`;

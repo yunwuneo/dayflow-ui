@@ -4,7 +4,7 @@ import rateLimit from '@fastify/rate-limit';
 import staticFiles from '@fastify/static';
 import { Pool } from 'pg';
 import { randomBytes } from 'node:crypto';
-import { readFile, mkdir, writeFile, rename, unlink } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
@@ -14,6 +14,7 @@ import { batch as batchSchema, date as dateSchema } from './contracts.ts';
 import { registerMcp } from './mcp.ts';
 import { activityFilters, getActivity, getOverview, getScreenshotHash, searchActivities } from './queries.ts';
 import { constantEquals, digest, hashPassword, verifyPassword } from './security.ts';
+import { prepareScreenshotStorage, ScreenshotStorageError, storeScreenshot } from './storage.ts';
 
 export { todayInZone } from './queries.ts';
 
@@ -22,13 +23,13 @@ const uuidQuery = z.object({ device_id: z.uuid() });
 const activityParams = z.object({ device: z.uuid(), record: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER) });
 
 export async function createApp(config: Config) {
+  await prepareScreenshotStorage(config.storageDir);
   const secureCookies = config.production && new URL(config.publicOrigin).protocol === 'https:';
   const pool = new Pool({ connectionString: config.databaseUrl, max: 10 });
   await pool.query(await readFile(new URL('./schema.sql', import.meta.url), 'utf8'));
   const existing = await pool.query('SELECT username FROM users WHERE username=$1', [config.adminUsername]);
   if (!existing.rowCount) await pool.query('INSERT INTO users VALUES($1,$2) ON CONFLICT DO NOTHING', [config.adminUsername, await hashPassword(config.adminPassword)]);
   const dummyHash = await hashPassword(randomBytes(32).toString('hex'));
-  await mkdir(config.storageDir, { recursive: true });
   const app = Fastify({ logger: config.logger ? { redact: ['req.headers.authorization', 'req.headers.cookie', 'res.headers.set-cookie'] } : false,
     trustProxy: config.trustProxy ? (_address, hop) => hop === 0 : false, bodyLimit: 16 * 1024 * 1024 });
   await app.register(cookie);
@@ -40,7 +41,8 @@ export async function createApp(config: Config) {
     const typed = error as Error & { statusCode?: number };
     const status = typed.statusCode || 500;
     if (status >= 500) request.log.error(error);
-    return reply.code(status).send({ error: status >= 500 ? '服务暂时不可用，请稍后重试' : typed.message });
+    return reply.code(status).send({ error: status >= 500 && !(error instanceof ScreenshotStorageError)
+      ? '服务暂时不可用，请稍后重试' : typed.message });
   });
   app.addHook('onRequest', async (request, reply) => {
     reply.header('X-Content-Type-Options', 'nosniff').header('Referrer-Policy', 'same-origin')
@@ -221,12 +223,7 @@ export async function createApp(config: Config) {
       image = await sharp(request.body, { limitInputPixels: 20_000_000 }).rotate().resize({ width: 1440, height: 1200, fit: 'inside', withoutEnlargement: true }).jpeg({ quality: 80 }).toBuffer();
     } catch { throw failure(400, '截图文件无法解码'); }
     const hash = digest(image);
-    const target = path.join(config.storageDir, `${hash}.jpg`);
-    if (!existsSync(target)) {
-      const temporary = `${target}.${randomBytes(8).toString('hex')}.tmp`;
-      try { await writeFile(temporary, image, { mode: 0o600 }); await rename(temporary, target); }
-      finally { await unlink(temporary).catch(() => {}); }
-    }
+    await storeScreenshot(config.storageDir, hash, image);
     // The first successful screenshot is retained with the archived activity.
     await pool.query('UPDATE activities SET screenshot_hash=$3 WHERE device_id=$1 AND record_id=$2 AND screenshot_hash IS NULL', [device, record, hash]);
     return reply.code(200).send({ ok: true });

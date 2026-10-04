@@ -58,9 +58,11 @@ npm run client:build
 open '.local/Dayflow Sync.app'
 ```
 
-应用只显示菜单栏图标。打开「设置」，填入服务器 HTTPS 地址和 `.env.production` 中的 `SYNC_TOKEN`，保存后会自动开始同步。设备令牌保存在 macOS 钥匙串；其他设置与待确认批次在 `~/Library/Application Support/DayflowSync/`。
+应用只显示菜单栏图标。打开「设置」，填入服务器地址和 `.env.production` 中的 `SYNC_TOKEN`，保存后会自动开始同步。服务器支持 HTTPS；本机地址以及 `192.168.x.x`、`100.64.x.x` 两个网段也允许 HTTP（无需 SSL/TLS），例如 `http://192.168.1.10:4310` 或 `http://100.64.1.10:4310`，与服务端允许的内网网段一致。设备令牌保存在 macOS 钥匙串；其他设置与待确认批次在 `~/Library/Application Support/DayflowSync/`。
 
 应用在运行期间按间隔调度；休眠不会唤醒 Mac，唤醒后恢复。网络失败后 5 分钟重试。暂停会取消当前工作，已经提交的批次仍然保留。菜单栏可以打开网页并选择开机启动。正式使用前将应用放到稳定路径，例如 `~/Applications/Dayflow Sync.app`，再开启登录项。构建产物为本机架构、临时签名，未做 Developer ID 公证。
+
+若旧版客户端保存内网 HTTP 地址后同步仍提示 App Transport Security（ATS）要求安全连接，请退出旧应用，重新运行 `npm run client:build`，替换原安装位置的应用后再打开。新版在应用包中配置了 HTTP IP 连接所需的 ATS 例外；同步仍会先校验上述地址白名单，并禁止跟随重定向。只修改设置或单独替换可执行文件不会更新应用包的 `Info.plist`。
 
 本地端到端导入（只允许 loopback 地址）：
 
@@ -109,6 +111,16 @@ docker compose --env-file .env.production ps
 生产环境也允许将 `PUBLIC_ORIGIN` 配置为 `http://192.168.x.x[:端口]` 或 `http://100.64.x.x[:端口]`，例如 `http://192.168.1.10:4310`。这两类地址使用 HTTP 时，登录和 Casdoor Cookie 不设置 `Secure`，以支持浏览器登录；其他地址仍要求 HTTPS。
 
 数据库、截图、证书均使用持久卷。`docker compose down` 保留这些卷；不要使用 `down -v`，除非确实需要清空数据。
+
+两个 Compose 配置都通过 `storage-init` 为截图目录设置 `node` 用户的属主和写入权限，完成后再启动 app。`compose-nginx.yaml` 使用宿主机目录 `./data/screenshots`；该挂载会覆盖镜像中 `/app/storage` 的权限，新目录可能由 Docker 创建为 root 所有。后端启动时会实际创建、删除临时文件检查可写性，运行期间的权限、只读挂载、磁盘空间错误也会返回明确的截图存储错误。
+
+旧部署如果出现「文本同步成功、截图上传 HTTP 500」，且 app 日志包含 `EACCES: permission denied, open '/app/storage/…tmp'`，可先修复目录权限：
+
+```sh
+docker compose -f compose-nginx.yaml --env-file=.env.production exec -u root app sh -c 'chown node:node /app/storage && chmod u+rwx /app/storage'
+```
+
+使用实际部署的 Compose 文件名和环境文件参数；例如服务器上叫 `compose.nginx.yaml` 时，相应替换 `-f` 参数。然后在客户端点击「立即同步」，会继续补传缺失截图，无需清空数据库或重新上传文本。更新项目后运行相同 Compose 参数的 `up -d --build`，让初始化服务和后端检查生效；app 仍以 `node` 用户运行。
 
 修改管理员密码：先更新 `.env.production` 的 `ADMIN_PASSWORD`，再执行：
 

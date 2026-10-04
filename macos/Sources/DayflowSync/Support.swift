@@ -81,12 +81,21 @@ struct Settings: Codable {
         guard let url = URL(string: serverURL.trimmingCharacters(in: .whitespacesAndNewlines)),
               let host = url.host, url.user == nil, url.password == nil,
               url.query == nil, url.fragment == nil, ["", "/"].contains(url.path),
-              url.scheme == "https" || (url.scheme == "http" && ["127.0.0.1", "localhost", "::1"].contains(host)) else {
-            throw SyncFailure("服务器地址须为 HTTPS；本机测试可使用 http://127.0.0.1:4310")
+              url.scheme == "https" || (url.scheme == "http" && Self.allowsHTTP(host: host)) else {
+            throw SyncFailure("服务器地址须为 HTTPS；本机、192.168.x.x 或 100.64.x.x 地址可使用 HTTP，例如 http://192.168.1.10:4310")
         }
         guard intervalMinutes >= 5 && intervalMinutes <= 1440 else { throw SyncFailure("同步间隔须为 5–1440 分钟") }
         guard UUID(uuidString: deviceID) != nil else { throw SyncFailure("设备 ID 无效") }
         return url
+    }
+    private static func allowsHTTP(host: String) -> Bool {
+        if ["127.0.0.1", "localhost", "::1", "[::1]"].contains(host.lowercased()) { return true }
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return false }
+        let octets = parts.compactMap { UInt8($0) }
+        guard octets.count == 4, zip(parts, octets).allSatisfy({ String($0.1) == String($0.0) }) else { return false }
+        // Match the server's HTTP allowlist: 192.168.0.0/16 and 100.64.0.0/16.
+        return (octets[0] == 192 && octets[1] == 168) || (octets[0] == 100 && octets[1] == 64)
     }
 }
 
