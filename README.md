@@ -106,6 +106,8 @@ docker compose --env-file .env.production ps
 
 初始化脚本创建 `.env.production`，其中数据库密码、管理员密码、同步令牌和只读令牌相互独立。文件已被 Git 和 Docker build context 排除。Caddy 自动申请 HTTPS 证书；数据库和 Node.js 端口不向公网发布。客户端服务器地址为 `https://dayflow.example.com`。
 
+生产环境也允许将 `PUBLIC_ORIGIN` 配置为 `http://192.168.x.x[:端口]` 或 `http://100.64.x.x[:端口]`，例如 `http://192.168.1.10:4310`。这两类地址使用 HTTP 时，登录和 Casdoor Cookie 不设置 `Secure`，以支持浏览器登录；其他地址仍要求 HTTPS。
+
 数据库、截图、证书均使用持久卷。`docker compose down` 保留这些卷；不要使用 `down -v`，除非确实需要清空数据。
 
 修改管理员密码：先更新 `.env.production` 的 `ADMIN_PASSWORD`，再执行：

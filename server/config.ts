@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { isIPv4 } from 'node:net';
 
 export interface Config {
   databaseUrl: string; storageDir: string; adminUsername: string; adminPassword: string;
@@ -14,8 +15,13 @@ export function configuration(): Config {
     return value;
   };
   const production = process.env.NODE_ENV === 'production';
-  const publicOrigin = new URL(required('PUBLIC_ORIGIN')).origin;
-  if (production && !publicOrigin.startsWith('https://')) throw new Error('Production requires an HTTPS PUBLIC_ORIGIN');
+  const publicUrl = new URL(required('PUBLIC_ORIGIN'));
+  const publicOrigin = publicUrl.origin;
+  const internalHttp = publicUrl.protocol === 'http:' && isIPv4(publicUrl.hostname)
+    && /^(192\.168|100\.64)\./.test(publicUrl.hostname);
+  if (production && publicUrl.protocol !== 'https:' && !internalHttp) {
+    throw new Error('Production requires an HTTPS PUBLIC_ORIGIN, except HTTP on 192.168.x.x or 100.64.x.x');
+  }
   if (process.env.READ_API_TOKEN && process.env.READ_API_TOKEN.length < 32) throw new Error('READ_API_TOKEN must contain at least 32 characters');
   if (process.env.READ_API_TOKEN && process.env.READ_API_TOKEN === process.env.SYNC_TOKEN) throw new Error('Read and sync tokens must be different');
   const casdoorValues = [process.env.CASDOOR_ORIGIN, process.env.CASDOOR_CLIENT_ID, process.env.CASDOOR_CLIENT_SECRET];

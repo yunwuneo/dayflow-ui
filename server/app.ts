@@ -22,6 +22,7 @@ const uuidQuery = z.object({ device_id: z.uuid() });
 const activityParams = z.object({ device: z.uuid(), record: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER) });
 
 export async function createApp(config: Config) {
+  const secureCookies = config.production && new URL(config.publicOrigin).protocol === 'https:';
   const pool = new Pool({ connectionString: config.databaseUrl, max: 10 });
   await pool.query(await readFile(new URL('./schema.sql', import.meta.url), 'utf8'));
   const existing = await pool.query('SELECT username FROM users WHERE username=$1', [config.adminUsername]);
@@ -78,7 +79,7 @@ export async function createApp(config: Config) {
     const token = randomBytes(32).toString('hex');
     await pool.query('DELETE FROM sessions WHERE expires_at < now()');
     await pool.query("INSERT INTO sessions VALUES($1,$2,now()+interval '7 days')", [digest(token), username]);
-    reply.setCookie('dayflow_session', token, { httpOnly: true, secure: config.production, sameSite: 'strict', path: '/', maxAge: 604800 });
+    reply.setCookie('dayflow_session', token, { httpOnly: true, secure: secureCookies, sameSite: 'strict', path: '/', maxAge: 604800 });
     return { username };
   };
   app.post('/api/v1/auth/login', { config: { rateLimit: { max: 8, timeWindow: '1 minute' } } }, async (request, reply) => {
@@ -92,7 +93,7 @@ export async function createApp(config: Config) {
   app.get('/api/v1/auth/casdoor/start', async (_request, reply) => {
     if (!config.casdoor) throw failure(503, 'Casdoor 登录尚未配置');
     const state = randomBytes(32).toString('hex');
-    reply.setCookie('casdoor_oauth_state', state, { httpOnly: true, secure: config.production, sameSite: 'lax', path: '/', maxAge: 600 });
+    reply.setCookie('casdoor_oauth_state', state, { httpOnly: true, secure: secureCookies, sameSite: 'lax', path: '/', maxAge: 600 });
     const authorize = new URL('/login/oauth/authorize', config.casdoor.origin);
     authorize.search = new URLSearchParams({ client_id: config.casdoor.clientId, response_type: 'code', redirect_uri: config.casdoor.redirectUri, scope: 'openid profile email', state }).toString();
     return reply.redirect(authorize.toString());
@@ -121,7 +122,7 @@ export async function createApp(config: Config) {
     const pending = randomBytes(32).toString('hex');
     await pool.query('DELETE FROM casdoor_link_intents WHERE expires_at < now()');
     await pool.query("INSERT INTO casdoor_link_intents(token_hash,subject,profile,expires_at) VALUES($1,$2,$3,now()+interval '10 minutes')", [digest(pending), subject, JSON.stringify({ displayName: profile.displayName, email: profile.email })]);
-    reply.setCookie('casdoor_pending', pending, { httpOnly: true, secure: config.production, sameSite: 'lax', path: '/', maxAge: 600 });
+    reply.setCookie('casdoor_pending', pending, { httpOnly: true, secure: secureCookies, sameSite: 'lax', path: '/', maxAge: 600 });
     return reply.redirect('/?casdoor=bind');
   });
   app.get('/api/v1/auth/casdoor/pending', async request => {

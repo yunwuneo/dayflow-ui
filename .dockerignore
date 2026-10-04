@@ -4,6 +4,7 @@ node_modules
 .env.*
 .local
 storage
+data
 macos
 dist
 test-results

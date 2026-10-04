@@ -53,6 +53,40 @@ test('Authenticated sync, reconciliation, archive and screenshot lifecycle', asy
     session = cookie.split(';')[0];
     assert.equal((await app.inject({ url: '/api/v1/overview', headers: { cookie: session } })).statusCode, 200);
   });
+  await t.test('Production HTTP cookies support internal login; HTTPS cookies stay Secure', async t => {
+    t.mock.method(globalThis, 'fetch', async (input: string | URL) => new Response(JSON.stringify(
+      new URL(input).pathname === '/api/login/oauth/access_token'
+        ? { access_token: 'test-access-token' } : { sub: 'test-casdoor-subject', displayName: 'Test' },
+    ), { headers: { 'content-type': 'application/json' } }));
+    for (const publicOrigin of ['http://192.168.1.10:4310', 'http://100.64.1.10:4310', 'https://dayflow.example.com']) {
+      const productionApp = await createApp({ ...config, production: true, publicOrigin,
+        casdoor: { origin: 'https://auth.example.com', clientId: 'test', clientSecret: 'test-secret',
+          redirectUri: `${publicOrigin}/api/v1/auth/casdoor/callback` } });
+      try {
+        const login = await productionApp.inject({ method: 'POST', url: '/api/v1/auth/login',
+          payload: { username: config.adminUsername, password: config.adminPassword },
+          headers: { 'x-dayflow-request': '1', origin: publicOrigin, host: 'attacker.example' } });
+        assert.equal(login.statusCode, 200, login.body);
+        const loginCookie = String(login.headers['set-cookie']);
+        const secure = publicOrigin.startsWith('https://');
+        assert.equal(/; Secure(?:;|$)/.test(loginCookie), secure);
+        assert.match(loginCookie, /HttpOnly/);
+        assert.match(loginCookie, /SameSite=Strict/);
+        assert.equal((await productionApp.inject({ url: '/api/v1/auth/session',
+          headers: { cookie: loginCookie.split(';')[0] } })).statusCode, 200);
+        const oauth = await productionApp.inject('/api/v1/auth/casdoor/start');
+        assert.equal(oauth.statusCode, 302);
+        assert.equal(/; Secure(?:;|$)/.test(String(oauth.headers['set-cookie'])), secure);
+        const state = new URL(String(oauth.headers.location)).searchParams.get('state');
+        const callback = await productionApp.inject({ url: `/api/v1/auth/casdoor/callback?code=test-code&state=${state}`,
+          headers: { cookie: String(oauth.headers['set-cookie']).split(';')[0] } });
+        assert.equal(callback.statusCode, 302, callback.body);
+        const pendingCookie = String(callback.headers['set-cookie']);
+        assert.match(pendingCookie, /casdoor_pending=/);
+        assert.equal(/casdoor_pending=[^,]*; Secure(?:;|$)/.test(pendingCookie), secure);
+      } finally { await productionApp.close(); }
+    }
+  });
   await t.test('First batch and replay are idempotent; old revisions conflict', async () => {
     const response = await app.inject({ method: 'POST', url: '/api/v1/sync/batch', headers: syncHeaders, payload: base });
     assert.equal(response.statusCode, 200, response.body); assert.equal(response.json().revision, 1);
