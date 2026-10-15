@@ -3,6 +3,10 @@ CREATE TABLE IF NOT EXISTS sync_preferences (
   notion_enabled boolean NOT NULL DEFAULT false
 );
 INSERT INTO sync_preferences(id) VALUES(1) ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS notion_settings (
+  id integer PRIMARY KEY CHECK (id=1), client_id text NOT NULL,
+  secret_ciphertext text NOT NULL, template_url text NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS notion_connection (
   id integer PRIMARY KEY CHECK (id=1), credentials text NOT NULL,
   workspace_id text NOT NULL, workspace_name text NOT NULL, bot_id text NOT NULL,

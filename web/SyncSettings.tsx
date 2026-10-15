@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Cloud, ExternalLink, FileText, LoaderCircle, RefreshCw, ShieldCheck } from 'lucide-react';
 import { api } from './api';
+import { NotionSetup, type NotionSetupInfo } from './NotionSetup';
 import './sync-settings.css';
 
 interface SyncStatus {
   cloud_enabled: boolean; notion_enabled: boolean; configured: boolean; template_url: string | null;
   pending: number; failed: number; synced: number; last_upload_at: string | null;
+  setup: NotionSetupInfo;
   connection: null | { workspace_name: string; workspace_id: string; page_id: string | null; data_source_id: string | null;
     connected_at: string; last_success_at: string | null; last_error: string | null; retry_at: string | null };
 }
@@ -23,6 +25,7 @@ export function SyncSettings() {
   const [pageId, setPageId] = useState('');
   const [busy, setBusy] = useState(false); const [error, setError] = useState('');
   const [disconnect, setDisconnect] = useState(false);
+  const [showSetup, setShowSetup] = useState(false);
   const [notice, setNotice] = useState(() => resultMessages[new URLSearchParams(location.search).get('notion') || ''] || '');
   const version = useRef(0); const acting = useRef(false);
   const refresh = useCallback(async (signal?: AbortSignal) => {
@@ -72,12 +75,24 @@ export function SyncSettings() {
       <section className="sync-card">
         <div className="sync-card-heading"><FileText size={23} /><div><h3>Notion 同步</h3><p>把活动文字、日报和周报整理到自己的 Notion 页面。</p></div>
           <label className="sync-switch"><input type="checkbox" role="switch" aria-label="Notion 同步" checked={status.notion_enabled} disabled={busy || !status.configured || !connection?.data_source_id} onChange={e => void toggle('notion_enabled', e.target.checked)} /><span>{status.notion_enabled ? '已开启' : '已关闭'}</span></label></div>
-        {!status.configured ? <p className="sync-warning">尚未配置 Notion 接入。管理员需要创建公开连接并配置授权凭据与模板，随后即可在这里授权。</p> : <>
+        {(!status.configured || showSetup) && <NotionSetup setup={status.setup} busy={busy} connected={Boolean(connection)} onSave={async (values, authorize) => {
+          await act(async () => {
+            const saved = await api<SyncStatus>('/integrations/notion/setup', { method: 'PUT', body: JSON.stringify(values) });
+            setStatus(saved); setShowSetup(false);
+            setNotice('连接信息已保存。点击「连接 Notion」即可前往 Notion 授权。');
+            if (authorize) {
+              const result = await api<{ url: string }>('/integrations/notion/authorize', { method: 'POST' });
+              location.assign(result.url);
+            }
+          });
+        }} />}
+        {status.configured && <>
           <div className="sync-connection"><ShieldCheck size={18} /><div><strong>{connection ? `已授权 · ${connection.workspace_name}` : '尚未授权 Notion'}</strong><p>{connection ? `授权时间：${format(connection.connected_at)}` : '授权时可使用开发者提供的模板，或选择已有页面。'}</p></div></div>
           <div className="sync-actions"><button className="primary" disabled={busy} onClick={() => void act(async () => {
             const result = await api<{ url: string }>('/integrations/notion/authorize', { method: 'POST' });
             location.assign(result.url);
           })}>{busy ? <LoaderCircle size={16} className="spin" /> : <ExternalLink size={16} />}{connection ? '重新授权' : '连接 Notion'}</button>
+            <button disabled={busy} onClick={() => setShowSetup(v => !v)}>{showSetup ? '收起连接配置' : '查看连接配置'}</button>
             {status.template_url && <a href={status.template_url} target="_blank" rel="noreferrer">预览开发者模板 <ExternalLink size={14} /></a>}
           </div>
           {!status.template_url && <p className="sync-caption">开发者模板尚未发布。可先授权已有页面，确认后会在其中创建标准同步数据库。</p>}

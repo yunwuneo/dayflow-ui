@@ -10,7 +10,9 @@ test('sync switches work without Notion credentials and preserve the cloud archi
   const cloud = page.getByRole('switch', { name: '云端同步', exact: true });
   await expect(cloud).toBeChecked();
   await expect(page.getByRole('switch', { name: 'Notion 同步', exact: true })).toBeDisabled();
-  await expect(page.getByText(/尚未配置 Notion 接入/)).toBeVisible();
+  await expect(page.getByRole('heading', { name: '配置 Notion 连接' })).toBeVisible();
+  await expect(page.getByLabel('OAuth Client Secret', { exact: true })).toHaveAttribute('type', 'password');
+  await expect(page.getByRole('link', { name: /打开 Notion 开发者控制台/ })).toHaveAttribute('href', 'https://www.notion.so/profile/integrations');
   try {
     await cloud.click(); await expect(cloud).not.toBeChecked();
     await expect(page.getByText('所有同步方式均已关闭，客户端将暂停上传。')).toBeVisible();
@@ -18,6 +20,43 @@ test('sync switches work without Notion credentials and preserve the cloud archi
     await expect(cloud).toBeEnabled(); await cloud.click(); await expect(cloud).toBeChecked();
   }
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});
+
+test('configure Notion entirely in WebUI and save directly into authorization', async ({ page }) => {
+  const state: any = { cloud_enabled: true, notion_enabled: false, configured: false, template_url: null,
+    pending: 0, failed: 0, synced: 0, last_upload_at: null, connection: null,
+    setup: { source: 'none', client_id: '', template_url: '', redirect_uri: 'https://fixture.example/api/v1/integrations/notion/callback', editable: true, available: true, error: null } };
+  let submissions = 0;
+  await page.route('https://api.notion.com/v1/oauth/authorize**', route => route.fulfill({ contentType: 'text/html; charset=utf-8', body: '<h1>虚构 Notion 授权页</h1>' }));
+  await page.route('**/api/v1/integrations/**', async route => {
+    const url = new URL(route.request().url());
+    if (url.pathname.endsWith('/setup')) {
+      const input = route.request().postDataJSON();
+      expect(input).toEqual({ client_id: 'fictional-client', client_secret: 'fictional-web-secret', template_url: '' });
+      submissions++; state.configured = true; state.setup.source = 'web'; state.setup.client_id = input.client_id;
+    }
+    if (url.pathname.endsWith('/authorize')) {
+      expect(submissions).toBe(1);
+      return route.fulfill({ json: { url: 'https://api.notion.com/v1/oauth/authorize?client_id=fictional-client&state=fixture' } });
+    }
+    return route.fulfill({ json: state });
+  });
+  await page.goto('/?view=status');
+  await page.getByLabel('用户名').fill(process.env.ADMIN_USERNAME!);
+  await page.getByLabel('密码', { exact: true }).fill(process.env.ADMIN_PASSWORD!);
+  await page.getByRole('button', { name: '登录', exact: true }).click();
+  await expect(page.getByLabel('OAuth 回调地址', { exact: true })).toHaveValue(state.setup.redirect_uri);
+  await page.getByLabel('OAuth Client ID', { exact: true }).fill('fictional-client');
+  await page.getByLabel('OAuth Client Secret', { exact: true }).fill('fictional-web-secret');
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.getByRole('button', { name: '保存并前往授权', exact: true }).click();
+  await expect.poll(() => submissions).toBe(1);
+  await expect(page).toHaveURL(/https:\/\/api.notion.com\/v1\/oauth\/authorize/);
+  await expect(page.getByRole('heading', { name: '虚构 Notion 授权页' })).toBeVisible();
+  expect(submissions).toBe(1);
+  await page.goto('/?view=status');
+  await page.getByRole('button', { name: '查看连接配置', exact: true }).click();
+  await expect(page.getByLabel('OAuth Client Secret', { exact: true })).toHaveValue('');
 });
 
 test('Notion onboarding, target, retry, error and disconnect controls', async ({ page }) => {

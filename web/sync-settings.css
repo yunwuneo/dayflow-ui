@@ -31,4 +31,13 @@
 .sync-warning, .sync-disconnect { background: #fff7e9; color: #785b2b; }
 .sync-template { font-size: 13px; color: #737a85; margin-top: 20px; }
 .sync-template summary { cursor: pointer; color: #47534c; }
+.notion-setup { margin-top: 24px; border-top: 1px solid #eef0f1; padding-top: 20px; font-size: 13px; }
+.notion-setup h4 { margin: 0 0 10px; font-size: 15px; }
+.notion-setup ol { padding-left: 22px; line-height: 1.8; }
+.notion-setup li { margin-bottom: 10px; }
+.notion-setup label { display: grid; gap: 7px; margin: 14px 0; }
+.notion-setup input { width: 100%; min-width: 0; padding: 10px 12px; border: 1px solid #dce1df; border-radius: 7px; background: #fff; font: inherit; }
+.notion-setup input[readonly] { background: #f7f8f8; }
+.notion-setup fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+.notion-setup fieldset:disabled { opacity: .6; }
 @media (max-width: 600px) { .sync-card { padding: 18px; } .sync-card-heading { flex-wrap: wrap; } .sync-switch { margin-left: 37px; } }

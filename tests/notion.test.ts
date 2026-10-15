@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, stat, rm, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Pool } from 'pg';
@@ -105,6 +105,7 @@ test('Notion OAuth, single-upload routing, durable retry and independent switche
     return { state: new URL(response.json().url).searchParams.get('state'), cookie: response.cookies.map(c => `${c.name}=${c.value}`).join('; ') };
   };
   await t.test('settings require the owner session; callback is one-use, browser/session bound', async () => {
+    assert.equal((await request('PUT', '/notion/setup', { client_id: 'other', client_secret: 'fictional' })).statusCode, 409);
     for (const token of [config.syncToken, config.readToken]) assert.equal((await app.inject({ method: 'GET', url: '/api/v1/integrations/sync', headers: { authorization: `Bearer ${token}` } })).statusCode, 401);
     assert.equal((await app.inject({ method: 'PATCH', url: '/api/v1/integrations/sync', headers: { cookie }, payload: { cloud_enabled: false } })).statusCode, 403);
     assert.equal((await request('PATCH', '/sync', { notion_enabled: true })).statusCode, 409);
@@ -219,4 +220,65 @@ test('Notion OAuth, single-upload routing, durable retry and independent switche
     assert.equal((await pool.query('SELECT * FROM activities')).rowCount, 1);
     assert.equal(fake.pages.size, pageCount);
   });
+});
+
+test('WebUI config persists encrypted, activates OAuth and dispatch without environment settings, and survives restart', async t => {
+  const admin = new Pool({ connectionString: testDatabaseUrl() }); await verifyTestDatabase(admin);
+  const schema = `test_setup_${randomUUID().replaceAll('-', '')}`; await admin.query(`CREATE SCHEMA ${schema}`);
+  const url = new URL(testDatabaseUrl()); url.searchParams.set('options', `-c search_path=${schema}`);
+  const pool = new Pool({ connectionString: url.toString() });
+  const storage = await mkdtemp(path.join(tmpdir(), 'dayflow-notion-setup-'));
+  const config = fixtureConfig(storage, url.toString());
+  const fake = new FakeNotion();
+  let app = await createApp(config, { notionApi: fake, startNotionWorker: false });
+  const worker = createNotionSync(pool, config, fake); // Created before any settings exist.
+  t.after(async () => { await worker.stop(); await app.close(); await pool.end(); await admin.query(`DROP SCHEMA ${schema} CASCADE`); await admin.end(); await rm(storage, { recursive: true, force: true }); });
+  const login = await app.inject({ method: 'POST', url: '/api/v1/auth/login', headers: { 'x-dayflow-request': '1' }, payload: { username: config.adminUsername, password: config.adminPassword } });
+  const cookie = login.cookies.map(c => `${c.name}=${c.value}`).join('; ');
+  const headers = { cookie, 'x-dayflow-request': '1', origin: config.publicOrigin };
+  const request = (method: any, route: string, payload?: any) => app.inject({ method, url: `/api/v1/integrations${route}`, headers, ...(payload === undefined ? {} : { payload }) });
+  const input = { client_id: 'web-client', client_secret: 'web-client-secret-fixture', template_url: '' };
+  const initial = (await request('GET', '/sync')).json();
+  assert.equal(initial.configured, false); assert.equal(initial.setup.editable, true);
+  assert.equal(initial.setup.redirect_uri, `${config.publicOrigin}/api/v1/integrations/notion/callback`);
+  assert.equal((await request('PUT', '/notion/setup', { ...input, client_secret: '' })).statusCode, 400);
+  assert.equal((await request('PUT', '/notion/setup', { ...input, template_url: 'https://evil.test' })).statusCode, 400);
+  await assert.rejects(stat(path.join(storage, '.notion-encryption-key')), { code: 'ENOENT' });
+  assert.equal((await app.inject({ method: 'PUT', url: '/api/v1/integrations/notion/setup', headers: { cookie }, payload: input })).statusCode, 403);
+  assert.equal((await app.inject({ method: 'PUT', url: '/api/v1/integrations/notion/setup', headers: { ...headers, cookie: '', authorization: `Bearer ${config.readToken}` }, payload: input })).statusCode, 401);
+  const saved = await request('PUT', '/notion/setup', input);
+  assert.equal(saved.statusCode, 200); assert.equal(saved.json().configured, true);
+  assert.equal(saved.json().setup.source, 'web'); assert.ok(!saved.body.includes(input.client_secret));
+  const keyPath = path.join(storage, '.notion-encryption-key'); const key = await readFile(keyPath, 'utf8');
+  assert.equal((await stat(keyPath)).mode & 0o777, 0o600);
+  const ciphertext = (await pool.query('SELECT secret_ciphertext FROM notion_settings')).rows[0].secret_ciphertext;
+  assert.ok(!ciphertext.includes(input.client_secret)); assert.equal(decryptTokens(ciphertext, key).access_token, input.client_secret);
+  const oldAuth = await request('POST', '/notion/authorize');
+  const oldState = new URL(oldAuth.json().url).searchParams.get('state');
+  assert.equal((await request('PUT', '/notion/setup', { client_id: input.client_id, template_url: 'https://example.notion.site/template' })).statusCode, 200);
+  assert.equal((await pool.query('SELECT secret_ciphertext FROM notion_settings')).rows[0].secret_ciphertext, ciphertext);
+  assert.equal((await app.inject({ url: `/api/v1/integrations/notion/callback?state=${oldState}&code=old`, headers: { cookie: oldAuth.cookies.map(c => `${c.name}=${c.value}`).join('; ') } })).statusCode, 400);
+  await app.close(); app = await createApp(config, { notionApi: fake, startNotionWorker: false });
+  assert.equal((await request('GET', '/sync')).json().setup.client_id, input.client_id);
+  assert.equal(await readFile(keyPath, 'utf8'), key);
+  const auth = await request('POST', '/notion/authorize'); const authUrl = new URL(auth.json().url);
+  assert.equal(authUrl.searchParams.get('client_id'), input.client_id);
+  const callback = await app.inject({ url: `/api/v1/integrations/notion/callback?state=${authUrl.searchParams.get('state')}&code=fixture`, headers: { cookie: auth.cookies.map(c => `${c.name}=${c.value}`).join('; ') } });
+  assert.match(callback.headers.location!, /notion=connected/);
+  assert.equal((await request('PUT', '/notion/setup', input)).statusCode, 409);
+  assert.equal((await request('POST', '/notion/target', { page_id: fake.root })).statusCode, 200);
+  assert.equal((await request('PATCH', '/sync', { cloud_enabled: false, notion_enabled: true })).statusCode, 200);
+  const device = randomUUID(); const day = '2026-10-15';
+  const batch = { device_id: device, device_name: 'Web setup fixture', batch_id: randomUUID(), expected_revision: 0,
+    time_zone: 'Asia/Shanghai', day_boundary_hour: 4, status: {}, categories: [], days: [], weeks: [],
+    dailies: [{ date: day, source_hash: digest('web-daily'), document: { highlights: ['WebUI 授权后的日报'] } }] };
+  assert.equal((await app.inject({ method: 'POST', url: '/api/v1/sync/batch', headers: { authorization: `Bearer ${config.syncToken}` }, payload: batch })).statusCode, 200);
+  await worker.tick(); assert.equal(fake.pages.size, 1); assert.equal((await request('GET', '/sync')).json().pending, 0);
+  assert.equal((await request('DELETE', '/notion')).statusCode, 200);
+  assert.equal((await request('GET', '/sync')).json().configured, true); // Disconnect keeps reusable app settings.
+  await rename(keyPath, `${keyPath}.fixture-backup`);
+  assert.equal((await request('POST', '/notion/authorize')).statusCode, 409);
+  assert.equal((await request('PUT', '/notion/setup', input)).statusCode, 409);
+  await assert.rejects(stat(keyPath), { code: 'ENOENT' });
+  await rename(`${keyPath}.fixture-backup`, keyPath);
 });

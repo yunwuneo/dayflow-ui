@@ -209,7 +209,7 @@ export async function createApp(config: Config, options: { notionApi?: NotionAPI
       await client.query('BEGIN');
       const prefs = await preferences(client, true);
       if (!prefs.cloud_enabled && !prefs.notion_enabled) throw failure(423, '所有同步方式均已关闭，请在网页同步设置中开启');
-      if (!prefs.cloud_enabled && !config.notion) throw failure(503, 'Notion 服务端配置缺失，暂时无法接收中转数据');
+      if (!prefs.cloud_enabled && !(await notion.settings.get(client))) throw failure(503, 'Notion 服务端配置缺失，暂时无法接收中转数据');
       await client.query('INSERT INTO devices(id,name,time_zone) VALUES($1,$2,$3) ON CONFLICT DO NOTHING', [data.device_id, data.device_name, data.time_zone]);
       const device = await client.query('SELECT revision FROM devices WHERE id=$1 FOR UPDATE', [data.device_id]);
       const previous = await client.query('SELECT revision FROM sync_batches WHERE device_id=$1 AND batch_id=$2', [data.device_id, data.batch_id]);

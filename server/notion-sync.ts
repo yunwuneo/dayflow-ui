@@ -3,6 +3,7 @@ import type { z } from 'zod';
 import type { batch } from './contracts.ts';
 import type { Config } from './config.ts';
 import { failure } from './auth.ts';
+import { notionSettings } from './notion-settings.ts';
 import { decryptTokens, encryptTokens, formatDocument, NotionAPI, NotionError, richText, splitText } from './notion-api.ts';
 
 export const NOTION_LOCK = 431017; // Per database: workers, target changes and disconnect serialize.
@@ -53,24 +54,29 @@ export function createNotionSync(pool: Pool, config: Config, api = new NotionAPI
   let running: Promise<void> | undefined;
   let stopped = false;
   let timer: ReturnType<typeof setInterval> | undefined;
-  const basic = () => `Basic ${Buffer.from(`${config.notion!.clientId}:${config.notion!.clientSecret}`).toString('base64')}`;
-  const oauth = (body: unknown, path = 'token') => api.request(`oauth/${path}`, basic(), 'POST', body);
+  const settings = notionSettings(config);
+  const oauth = async (db: Pool | PoolClient, body: unknown, path = 'token') => {
+    const n = await settings.get(db);
+    if (!n) throw failure(409, '请先在网页填写 Notion 连接信息');
+    return api.request(`oauth/${path}`, `Basic ${Buffer.from(`${n.clientId}:${n.clientSecret}`).toString('base64')}`, 'POST', body);
+  };
   async function call(db: PoolClient, path: string, method = 'GET', body?: unknown) {
-    if (!config.notion) throw failure(503, 'Notion 接入尚未配置');
+    const n = await settings.get(db);
+    if (!n) throw failure(409, '请先在网页填写 Notion 连接信息');
     const connection = (await db.query('SELECT credentials FROM notion_connection WHERE id=1')).rows[0];
     if (!connection) throw failure(409, '请先授权 Notion');
-    const tokens = decryptTokens(connection.credentials, config.notion.encryptionKey);
+    const tokens = decryptTokens(connection.credentials, n.encryptionKey);
     try { return await api.request(path, `Bearer ${tokens.access_token}`, method, body); }
     catch (error) {
       if (!(error instanceof NotionError) || error.status !== 401 || !tokens.refresh_token) throw error;
-      const refreshed = await oauth({ grant_type: 'refresh_token', refresh_token: tokens.refresh_token });
+      const refreshed = await oauth(db, { grant_type: 'refresh_token', refresh_token: tokens.refresh_token });
       if (!refreshed.access_token || !refreshed.refresh_token) throw new NotionError(401);
-      await db.query('UPDATE notion_connection SET credentials=$1 WHERE id=1', [encryptTokens({ access_token: refreshed.access_token, refresh_token: refreshed.refresh_token }, config.notion.encryptionKey)]);
+      await db.query('UPDATE notion_connection SET credentials=$1 WHERE id=1', [encryptTokens({ access_token: refreshed.access_token, refresh_token: refreshed.refresh_token }, n.encryptionKey)]);
       return api.request(path, `Bearer ${refreshed.access_token}`, method, body);
     }
   }
   async function run() {
-    if (!config.notion || stopped) return;
+    if (stopped) return;
     const db = await pool.connect(); let locked = false;
     try {
       locked = (await db.query('SELECT pg_try_advisory_lock($1) AS locked', [NOTION_LOCK])).rows[0].locked;
@@ -151,8 +157,8 @@ export function createNotionSync(pool: Pool, config: Config, api = new NotionAPI
     running = run().finally(() => { running = undefined; });
     return running;
   };
-  return { call, oauth, tick,
-    start() { if (config.notion && !timer) { timer = setInterval(() => { void tick().catch(() => {}); }, 2000); timer.unref(); } },
+  return { call, oauth, tick, settings,
+    start() { if (!timer) { timer = setInterval(() => { void tick().catch(() => {}); }, 2000); timer.unref(); } },
     async stop() { stopped = true; if (timer) clearInterval(timer); await running; },
   };
 }
