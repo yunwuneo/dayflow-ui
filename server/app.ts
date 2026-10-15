@@ -9,7 +9,12 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
 import { z, ZodError } from 'zod';
-import type { Config } from './config.ts';
+import { validateOAuth, validateNotion, type Config } from './config.ts';
+import { registerNotion } from './notion.ts';
+import { enqueueBatch, preferences } from './notion-sync.ts';
+import { NotionAPI, NotionError } from './notion-api.ts';
+import { nativeAuth, failure } from './auth.ts';
+import { createOAuth } from './oauth.ts';
 import { batch as batchSchema, date as dateSchema } from './contracts.ts';
 import { registerMcp } from './mcp.ts';
 import { activityFilters, getActivity, getOverview, getScreenshotHash, searchActivities } from './queries.ts';
@@ -18,25 +23,34 @@ import { prepareScreenshotStorage, ScreenshotStorageError, storeScreenshot } fro
 
 export { todayInZone } from './queries.ts';
 
-const failure = (statusCode: number, message: string) => Object.assign(new Error(message), { statusCode });
 const uuidQuery = z.object({ device_id: z.uuid() });
 const activityParams = z.object({ device: z.uuid(), record: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER) });
 
-export async function createApp(config: Config) {
+export async function createApp(config: Config, options: { notionApi?: NotionAPI; startNotionWorker?: boolean } = {}) {
+  validateOAuth(config);
+  validateNotion(config);
   await prepareScreenshotStorage(config.storageDir);
   const secureCookies = config.production && new URL(config.publicOrigin).protocol === 'https:';
   const pool = new Pool({ connectionString: config.databaseUrl, max: 10 });
   await pool.query(await readFile(new URL('./schema.sql', import.meta.url), 'utf8'));
+  await pool.query(await readFile(new URL('./oauth-schema.sql', import.meta.url), 'utf8'));
+  await pool.query(await readFile(new URL('./notion-schema.sql', import.meta.url), 'utf8'));
   const existing = await pool.query('SELECT username FROM users WHERE username=$1', [config.adminUsername]);
   if (!existing.rowCount) await pool.query('INSERT INTO users VALUES($1,$2) ON CONFLICT DO NOTHING', [config.adminUsername, await hashPassword(config.adminPassword)]);
   const dummyHash = await hashPassword(randomBytes(32).toString('hex'));
-  const app = Fastify({ logger: config.logger ? { redact: ['req.headers.authorization', 'req.headers.cookie', 'res.headers.set-cookie'] } : false,
+  const app = Fastify({ logger: config.logger ? { redact: ['req.headers.authorization', 'req.headers.cookie', 'res.headers.set-cookie'],
+    serializers: { req: req => ({ method: req.method, url: req.url?.split('?')[0], remoteAddress: req.ip }) } } : false,
     trustProxy: config.trustProxy ? (_address, hop) => hop === 0 : false, bodyLimit: 16 * 1024 * 1024 });
   await app.register(cookie);
   await app.register(rateLimit, { global: false });
+  app.decorateRequest('sessionUsername', null);
+  const auth = nativeAuth(pool, config, dummyHash);
+  const oauth = createOAuth(app, pool, config, auth);
   app.addContentTypeParser('image/jpeg', { parseAs: 'buffer', bodyLimit: 3 * 1024 * 1024 }, (_req, body, done) => done(null, body));
-  app.addHook('onClose', async () => { await pool.end(); });
+  let notion: ReturnType<typeof registerNotion>;
+  app.addHook('onClose', async () => { await notion?.stop(); await pool.end(); });
   app.setErrorHandler((error, request, reply) => {
+    if (error instanceof NotionError) return reply.code(502).send({ error: error.message });
     if (error instanceof ZodError) return reply.code(400).send({ error: '请求格式不正确', details: error.issues.map(i => i.path.join('.') + ': ' + i.message) });
     const typed = error as Error & { statusCode?: number };
     const status = typed.statusCode || 500;
@@ -45,51 +59,56 @@ export async function createApp(config: Config) {
       ? '服务暂时不可用，请稍后重试' : typed.message });
   });
   app.addHook('onRequest', async (request, reply) => {
+    const route = request.routeOptions.url || request.url.split('?')[0];
+    // Chrome applies form-action to a form's redirect chain as well. Allow only
+    // configured HTTPS callback origins on the login/consent documents; the
+    // authorization server still validates the full exact redirect URI.
+    const callbackOrigins = config.oauth && ['/oauth/authorize', '/oauth/login'].includes(route)
+      ? [...new Set(config.oauth.redirectUris.map(uri => new URL(uri).origin))].join(' ') : '';
     reply.header('X-Content-Type-Options', 'nosniff').header('Referrer-Policy', 'same-origin')
       .header('X-Frame-Options', 'DENY')
-      .header('Content-Security-Policy', "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
+      .header('Content-Security-Policy', `default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' ${callbackOrigins}`.trim());
+    if (route.startsWith('/oauth/') || route.startsWith('/.well-known/oauth')) reply.header('Referrer-Policy', 'same-origin');
     const url = request.routeOptions.url || request.url.split('?')[0];
     if (!url.startsWith('/api/') && url !== '/mcp') return;
     reply.header('Cache-Control', 'no-store');
     const authorization = request.headers.authorization;
     const bearer = authorization?.startsWith('Bearer ') ? authorization.slice(7) : '';
-    // MCP clients are not browsers: only the read token grants access, never a session cookie.
+    // MCP accepts only an Authorization header; cookies and sync credentials never authorize it.
     if (url === '/mcp') {
-      if (!config.readToken) throw failure(404, '接口不存在');
-      if (!bearer || !constantEquals(bearer, config.readToken)) throw failure(401, '只读令牌无效');
-      return;
+      if (!config.readToken && !oauth) throw failure(404, '接口不存在');
+      if (bearer && config.readToken && constantEquals(bearer, config.readToken)) return;
+      if (bearer && oauth && !constantEquals(bearer, config.syncToken) && await oauth.authenticate(bearer)) return;
+      reply.header('WWW-Authenticate', oauth ? oauth.challenge : 'Bearer realm="dayflow-mcp"');
+      throw failure(401, '只读令牌无效');
     }
     if (url.startsWith('/api/v1/sync/')) {
       if (!bearer || !constantEquals(bearer, config.syncToken)) throw failure(401, '设备令牌无效');
       return;
     }
+    // The callback validates a one-use state bound to a live owner session and a
+    // separate SameSite=Lax browser nonce; the login cookie remains Strict.
+    if (url === '/api/v1/integrations/notion/callback' && request.method === 'GET') return;
     if (!['GET', 'HEAD'].includes(request.method)) {
       if (request.headers['x-dayflow-request'] !== '1') throw failure(403, '缺少请求校验标记');
       const origin = request.headers.origin;
       if (origin && origin !== config.publicOrigin) throw failure(403, '请求来源不受信任');
     }
     if (['/api/v1/auth/login', '/api/v1/auth/casdoor/start', '/api/v1/auth/casdoor/callback', '/api/v1/auth/casdoor/config', '/api/v1/auth/casdoor/pending', '/api/v1/auth/casdoor/bind'].includes(url)) return;
-    if (['GET', 'HEAD'].includes(request.method) && config.readToken && bearer && constantEquals(bearer, config.readToken)) return;
-    const token = request.cookies.dayflow_session;
-    if (!token) throw failure(401, '请先登录');
-    const session = await pool.query('SELECT username FROM sessions WHERE token_hash=$1 AND expires_at>now()', [digest(token)]);
-    if (!session.rowCount) throw failure(401, '登录已过期');
+    if (!url.startsWith('/api/v1/auth/') && !url.startsWith('/api/v1/integrations/') && ['GET', 'HEAD'].includes(request.method) && config.readToken && bearer && constantEquals(bearer, config.readToken)) return;
+    request.sessionUsername = await auth.session(request);
+    if (!request.sessionUsername) throw failure(401, '请先登录或登录已过期');
+    if (config.oauth && !url.startsWith('/api/v1/auth/') && request.sessionUsername !== config.oauth.ownerUsername) throw failure(403, '只有档案所有者可以读取');
   });
 
+  notion = registerNotion(app, pool, config, options.notionApi);
+  app.addHook('onReady', async () => { if (options.startNotionWorker !== false) notion.start(); });
+
   app.get('/health', async () => { await pool.query('SELECT 1'); return { ok: true }; });
-  const establishSession = async (username: string, reply: any) => {
-    const token = randomBytes(32).toString('hex');
-    await pool.query('DELETE FROM sessions WHERE expires_at < now()');
-    await pool.query("INSERT INTO sessions VALUES($1,$2,now()+interval '7 days')", [digest(token), username]);
-    reply.setCookie('dayflow_session', token, { httpOnly: true, secure: secureCookies, sameSite: 'strict', path: '/', maxAge: 604800 });
-    return { username };
-  };
+  const establishSession = auth.establish;
   app.post('/api/v1/auth/login', { config: { rateLimit: { max: 8, timeWindow: '1 minute' } } }, async (request, reply) => {
     const { username, password } = z.object({ username: z.string().max(200), password: z.string().max(1000) }).parse(request.body);
-    const result = await pool.query('SELECT password_hash FROM users WHERE username=$1', [username]);
-    const valid = await verifyPassword(password, result.rows[0]?.password_hash || dummyHash);
-    if (!valid || !result.rowCount) throw failure(401, '用户名或密码不正确');
-    return establishSession(username, reply);
+    return auth.login(username, password, reply);
   });
   app.get('/api/v1/auth/casdoor/config', async () => ({ enabled: Boolean(config.casdoor) }));
   app.get('/api/v1/auth/casdoor/start', async (_request, reply) => {
@@ -153,7 +172,7 @@ export async function createApp(config: Config) {
     reply.clearCookie('casdoor_pending', { path: '/' });
     return establishSession(username, reply);
   });
-  app.get('/api/v1/auth/session', async () => ({ username: config.adminUsername }));
+  app.get('/api/v1/auth/session', async request => ({ username: request.sessionUsername }));
   app.post('/api/v1/auth/logout', async (request, reply) => {
     if (request.cookies.dayflow_session) await pool.query('DELETE FROM sessions WHERE token_hash=$1', [digest(request.cookies.dayflow_session)]);
     reply.clearCookie('dayflow_session', { path: '/' });
@@ -162,50 +181,71 @@ export async function createApp(config: Config) {
 
   app.get('/api/v1/sync/state', async request => {
     const { device_id } = uuidQuery.parse(request.query);
-    const [device, days, documents, activities] = await Promise.all([
-      pool.query('SELECT revision FROM devices WHERE id=$1', [device_id]),
-      pool.query('SELECT day::text,source_hash FROM source_days WHERE device_id=$1', [device_id]),
-      pool.query('SELECT kind,day::text,source_hash FROM documents WHERE device_id=$1', [device_id]),
-      pool.query('SELECT record_id::float8,day::text,content_hash,source_deleted,screenshot_hash IS NOT NULL AS has_screenshot FROM activities WHERE device_id=$1', [device_id]),
-    ]);
-    return { revision: device.rows[0]?.revision || 0, days: days.rows, documents: documents.rows, activities: activities.rows };
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+      const prefs = await preferences(client);
+      if (!prefs.cloud_enabled) {
+        const device = await client.query('SELECT revision FROM devices WHERE id=$1', [device_id]);
+        const days = await client.query('SELECT day::text,source_hash FROM notion_days WHERE device_id=$1', [device_id]);
+        const items = await client.query('SELECT key,kind,day::text,source_hash,source_deleted FROM notion_items WHERE device_id=$1', [device_id]);
+        return { revision: device.rows[0]?.revision || 0, ...prefs, paused: !prefs.notion_enabled,
+          days: days.rows, documents: items.rows.filter(i => i.kind !== 'activity').map(i => ({ kind: i.kind, day: i.day, source_hash: i.source_hash })),
+          activities: items.rows.filter(i => i.kind === 'activity').map(i => ({ record_id: Number(i.key.split(':').at(-1)), day: i.day,
+            content_hash: i.source_hash, source_deleted: i.source_deleted, has_screenshot: true })),
+        };
+      }
+      const device = await client.query('SELECT revision FROM devices WHERE id=$1', [device_id]);
+      const days = await client.query('SELECT day::text,source_hash FROM source_days WHERE device_id=$1', [device_id]);
+      const documents = await client.query('SELECT kind,day::text,source_hash FROM documents WHERE device_id=$1', [device_id]);
+      const activities = await client.query('SELECT record_id::float8,day::text,content_hash,source_deleted,screenshot_hash IS NOT NULL AS has_screenshot FROM activities WHERE device_id=$1', [device_id]);
+      return { revision: device.rows[0]?.revision || 0, ...prefs, paused: false, days: days.rows, documents: documents.rows, activities: activities.rows };
+    } finally { await client.query('ROLLBACK'); client.release(); }
   });
   app.post('/api/v1/sync/batch', async request => {
     const data = batchSchema.parse(request.body);
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      const prefs = await preferences(client, true);
+      if (!prefs.cloud_enabled && !prefs.notion_enabled) throw failure(423, '所有同步方式均已关闭，请在网页同步设置中开启');
+      if (!prefs.cloud_enabled && !config.notion) throw failure(503, 'Notion 服务端配置缺失，暂时无法接收中转数据');
       await client.query('INSERT INTO devices(id,name,time_zone) VALUES($1,$2,$3) ON CONFLICT DO NOTHING', [data.device_id, data.device_name, data.time_zone]);
       const device = await client.query('SELECT revision FROM devices WHERE id=$1 FOR UPDATE', [data.device_id]);
       const previous = await client.query('SELECT revision FROM sync_batches WHERE device_id=$1 AND batch_id=$2', [data.device_id, data.batch_id]);
       if (previous.rowCount) { await client.query('COMMIT'); return { revision: previous.rows[0].revision, replayed: true }; }
       if (device.rows[0].revision !== data.expected_revision) throw failure(409, '同步版本已变化，请重新获取同步清单');
-      // Apply all upserts before reconciliation so a record can safely move between days.
-      for (const day of data.days) for (const item of day.activities) {
-        await client.query(`INSERT INTO activities(device_id,record_id,day,start_at,end_at,content_hash,payload)
-          VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(device_id,record_id) DO UPDATE SET
-          day=EXCLUDED.day,start_at=EXCLUDED.start_at,end_at=EXCLUDED.end_at,content_hash=EXCLUDED.content_hash,
-          payload=EXCLUDED.payload,source_deleted=false,deleted_at=NULL,updated_at=now()`,
-        [data.device_id, item.data.record_id, day.date, item.data.start, item.data.end, item.content_hash, item.data]);
-      }
-      for (const day of data.days) {
-        const known = await client.query('SELECT record_id FROM activities WHERE device_id=$1 AND day=$2 AND record_id=ANY($3::bigint[])', [data.device_id, day.date, day.active_ids]);
-        if (known.rowCount !== day.active_ids.length) throw failure(400, '同步清单包含缺少内容的活动');
-        await client.query(`UPDATE activities SET source_deleted=true,deleted_at=now(),updated_at=now()
-          WHERE device_id=$1 AND day=$2 AND NOT source_deleted AND NOT(record_id=ANY($3::bigint[]))`, [data.device_id, day.date, day.active_ids]);
-        await client.query(`UPDATE activities SET source_deleted=false,deleted_at=NULL,updated_at=now()
-          WHERE device_id=$1 AND day=$2 AND source_deleted AND record_id=ANY($3::bigint[])`, [data.device_id, day.date, day.active_ids]);
-        await client.query('INSERT INTO source_days VALUES($1,$2,$3) ON CONFLICT(device_id,day) DO UPDATE SET source_hash=EXCLUDED.source_hash', [data.device_id, day.date, day.source_hash]);
-      }
-      for (const [kind, docs] of [['daily', data.dailies], ['weekly', data.weeks]] as const) for (const doc of docs) {
-        await client.query(`INSERT INTO documents(device_id,kind,day,source_hash,payload) VALUES($1,$2,$3,$4,$5)
-          ON CONFLICT(device_id,kind,day) DO UPDATE SET source_hash=EXCLUDED.source_hash,payload=EXCLUDED.payload,updated_at=now()`,
-        [data.device_id, kind, doc.date, doc.source_hash, doc.document]);
+      if (prefs.notion_enabled) await enqueueBatch(client, data);
+      if (prefs.cloud_enabled) {
+        // Apply all upserts before reconciliation so a record can safely move between days.
+        for (const day of data.days) for (const item of day.activities) {
+          await client.query(`INSERT INTO activities(device_id,record_id,day,start_at,end_at,content_hash,payload)
+            VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(device_id,record_id) DO UPDATE SET
+            day=EXCLUDED.day,start_at=EXCLUDED.start_at,end_at=EXCLUDED.end_at,content_hash=EXCLUDED.content_hash,
+            payload=EXCLUDED.payload,source_deleted=false,deleted_at=NULL,updated_at=now()`,
+          [data.device_id, item.data.record_id, day.date, item.data.start, item.data.end, item.content_hash, item.data]);
+        }
+        for (const day of data.days) {
+          const known = await client.query('SELECT record_id FROM activities WHERE device_id=$1 AND day=$2 AND record_id=ANY($3::bigint[])', [data.device_id, day.date, day.active_ids]);
+          if (known.rowCount !== day.active_ids.length) throw failure(400, '同步清单包含缺少内容的活动');
+          await client.query(`UPDATE activities SET source_deleted=true,deleted_at=now(),updated_at=now()
+            WHERE device_id=$1 AND day=$2 AND NOT source_deleted AND NOT(record_id=ANY($3::bigint[]))`, [data.device_id, day.date, day.active_ids]);
+          await client.query(`UPDATE activities SET source_deleted=false,deleted_at=NULL,updated_at=now()
+            WHERE device_id=$1 AND day=$2 AND source_deleted AND record_id=ANY($3::bigint[])`, [data.device_id, day.date, day.active_ids]);
+          await client.query('INSERT INTO source_days VALUES($1,$2,$3) ON CONFLICT(device_id,day) DO UPDATE SET source_hash=EXCLUDED.source_hash', [data.device_id, day.date, day.source_hash]);
+        }
+        for (const [kind, docs] of [['daily', data.dailies], ['weekly', data.weeks]] as const) for (const doc of docs) {
+          await client.query(`INSERT INTO documents(device_id,kind,day,source_hash,payload) VALUES($1,$2,$3,$4,$5)
+            ON CONFLICT(device_id,kind,day) DO UPDATE SET source_hash=EXCLUDED.source_hash,payload=EXCLUDED.payload,updated_at=now()`,
+          [data.device_id, kind, doc.date, doc.source_hash, doc.document]);
+        }
       }
       const revision = data.expected_revision + 1;
       await client.query(`UPDATE devices SET name=$2,revision=$3,time_zone=$4,day_boundary_hour=$5,
-        status=$6,categories=$7,last_sync_at=now() WHERE id=$1`,
-      [data.device_id, data.device_name, revision, data.time_zone, data.day_boundary_hour, data.status, JSON.stringify(data.categories)]);
+        status=CASE WHEN $8::boolean THEN $6::jsonb ELSE status END,
+        categories=CASE WHEN $8::boolean THEN $7::jsonb ELSE categories END,last_sync_at=now() WHERE id=$1`,
+      [data.device_id, data.device_name, revision, data.time_zone, data.day_boundary_hour,
+        prefs.cloud_enabled ? data.status : {}, JSON.stringify(prefs.cloud_enabled ? data.categories : []), prefs.cloud_enabled]);
       await client.query('INSERT INTO sync_batches(device_id,batch_id,revision) VALUES($1,$2,$3)', [data.device_id, data.batch_id, revision]);
       await client.query('COMMIT');
       return { revision, replayed: false };
@@ -214,6 +254,7 @@ export async function createApp(config: Config) {
   });
   app.put('/api/v1/sync/activities/:device/:record/screenshot', async (request, reply) => {
     const { device, record } = activityParams.parse(request.params);
+    if (!(await preferences(pool)).cloud_enabled) return { ok: true, skipped: true };
     if (!Buffer.isBuffer(request.body)) throw failure(415, '截图必须为 JPEG');
     const exists = await pool.query('SELECT screenshot_hash FROM activities WHERE device_id=$1 AND record_id=$2', [device, record]);
     if (!exists.rowCount) throw failure(404, '活动不存在');

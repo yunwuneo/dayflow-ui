@@ -4,6 +4,8 @@
 
 ## 已实现
 
+- 可选 Notion 同步：服务端转发活动文字、日报和周报，云端与 Notion 独立开关；网页提供 OAuth 授权、模板/页面选择、队列状态和重试。配置与模板生成见 [Notion 接入指南](docs/notion-sync.md)。
+
 - 首次导入 Dayflow 当前有效的全部历史；不追溯导入源端已经删除的旧版本。
 - 每 30 分钟自动检查变化；CLI 只读取变化日期，网络仅上传变化活动、文档和缺失截图。
 - 重试与断点续传：服务端保存同步清单，客户端在提交前持久化待确认批次；批次 ID 保证重试幂等，版本号防止旧批次覆盖新状态。
@@ -129,7 +131,7 @@ docker compose --env-file .env.production run --rm app node --import tsx scripts
 docker compose --env-file .env.production up -d app
 ```
 
-该操作撤销已有浏览器会话。单纯修改环境变量不会改变已创建账号的密码。令牌轮换需更新环境变量、重启 app，并更新客户端设置。
+该操作撤销该账号已有浏览器会话及 MCP OAuth 授权。单纯修改环境变量不会改变已创建账号的密码。令牌轮换需更新环境变量、重启 app，并更新客户端设置。
 
 备份时分别保存数据库与截图，并妥善保管生产环境文件：
 
@@ -166,7 +168,7 @@ Casdoor 登录通过 `CASDOOR_ORIGIN`、`CASDOOR_CLIENT_ID`、`CASDOOR_CLIENT_SE
 
 ## MCP
 
-配置 `READ_API_TOKEN` 后，`POST /mcp` 提供只读的 MCP 服务（Streamable HTTP，无会话，JSON 响应），供 Claude Code、Cursor 等可自定义请求头的 AI 客户端查询档案。仅接受 `Authorization: Bearer <READ_API_TOKEN>`；会话 Cookie 和 `SYNC_TOKEN` 均会被拒绝。未配置只读令牌时该接口返回 404。每分钟最多 60 次请求。
+配置 `READ_API_TOKEN` 或启用 MCP OAuth 后，`POST /mcp` 提供只读的 MCP 服务（Streamable HTTP，无会话，JSON 响应），供 Claude Code、Cursor 等可自定义请求头的 AI 客户端查询档案。接受固定 `Authorization: Bearer <READ_API_TOKEN>`，也可接受绑定所有者、客户端、资源及 scope 的 OAuth access token；会话 Cookie 和 `SYNC_TOKEN` 均会被拒绝。两种认证均未配置时返回 404。每分钟最多 60 次请求。
 
 | 工具 | 用途 |
 | --- | --- |
@@ -182,6 +184,8 @@ claude mcp add --transport http dayflow https://dayflow.example.com/mcp \
 ```
 
 截图会发送给所连接的 AI 客户端及其模型服务，接入前请确认可以接受。
+
+ChatGPT 自定义 MCP 的原生登录 OAuth、配置、授权撤销、数据库迁移与回滚、待确认的上线步骤及测试边界，见 [MCP OAuth 手册](docs/mcp-oauth.md)。默认关闭，不依赖 Casdoor。
 
 ## 一致性与边界
 
@@ -204,6 +208,6 @@ npm run test:ui
 npm audit
 ```
 
-浏览器测试需要先执行 `npx playwright install chromium`；已有 Google Chrome 时也可运行 `PLAYWRIGHT_CHANNEL=chrome npm run test:ui`。
+测试命令不加载 `.env`，自动使用现有 `initdb`、`pg_ctl`、`createdb` 创建临时 PostgreSQL 实例，仅监听临时 Unix socket，结束后停止并删除。服务端测试使用其中的随机 schema，不连接业务数据库。
 
-服务端测试在随机独立 PostgreSQL schema 内运行，结束后清理，不改动实际档案。浏览器测试需要服务端运行、已经执行本地同步，且历史中存在 2026-09-16 的记录与日报；测试在桌面和手机宽度验证时间线、截图、搜索、日报、周统计、登录注销及横向溢出。测试截图在 `test-results/`，包含个人活动内容，不提交到 Git。
+`npm run test:ui` 自动启动虚构活动/纯色截图的临时服务，在桌面和手机宽度验证原生网页及 OAuth 登录、确认、拒绝、撤销；默认复用已安装 Google Chrome，无需事先同步或下载浏览器。临时浏览器截图和报告结束后清理。若使用别的已安装 Playwright 浏览器，可设置 PLAYWRIGHT_CHANNEL。

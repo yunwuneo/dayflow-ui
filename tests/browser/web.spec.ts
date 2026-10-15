@@ -1,6 +1,8 @@
 import { expect, test } from '@playwright/test';
 
-test('browse real timelines, screenshots, daily, weekly, search and logout', async ({ page }, info) => {
+test.beforeEach(() => { if (!process.env.DAYFLOW_TEST_ROOT) throw new Error('Use npm run test:ui; real datasets are forbidden'); });
+
+test('browse fictional timelines, screenshots, daily, weekly, search and logout', async ({ page }, info) => {
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.goto('/');
@@ -11,19 +13,19 @@ test('browse real timelines, screenshots, daily, weekly, search and logout', asy
   await page.getByLabel('选择日期').fill('2026-09-16');
   await expect(page.locator('.activity-row').first()).toBeVisible();
   await expect.poll(() => page.locator('.activity-thumbnail').evaluateAll(elements => elements.filter(element => element instanceof HTMLImageElement && element.complete && element.naturalWidth > 0).length)).toBeGreaterThan(0);
-  await page.screenshot({ path: `test-results/${info.project.name}-timeline.png`, fullPage: false });
+  await page.screenshot({ path: info.outputPath('timeline.png'), fullPage: false });
   await page.locator('.activity-row').first().click();
   await expect(page.getByLabel('活动详情')).toBeVisible();
   await page.getByRole('button', { name: '放大截图' }).click();
   await expect(page.locator('dialog')).toBeVisible();
   await page.getByRole('button', { name: '关闭大图' }).click();
-  await page.screenshot({ path: `test-results/${info.project.name}-detail.png`, fullPage: false });
+  await page.screenshot({ path: info.outputPath('detail.png'), fullPage: false });
   await page.getByRole('button', { name: '关闭详情' }).click();
   await page.getByRole('tab', { name: '日报', exact: true }).click();
   await expect(page.getByRole('heading', { name: '每日回顾' })).toBeVisible();
   await page.getByRole('tab', { name: '周统计', exact: true }).click();
   await expect(page.getByRole('heading', { name: '本周时间分配' })).toBeVisible();
-  await page.screenshot({ path: `test-results/${info.project.name}-weekly.png`, fullPage: false });
+  await page.screenshot({ path: info.outputPath('weekly.png'), fullPage: false });
   if (info.project.name === 'mobile') await page.getByRole('button', { name: '打开导航' }).click();
   await page.getByRole('button', { name: '搜索活动', exact: true }).click();
   await page.getByRole('textbox', { name: '搜索活动' }).fill('项目');

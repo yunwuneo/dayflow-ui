@@ -86,7 +86,18 @@ export function registerMcp(app: FastifyInstance, pool: Pool, config: Config) {
       const response = await transport.handleRequest(new Request(new URL('/mcp', config.publicOrigin), { method: 'POST', headers }), { parsedBody: request.body });
       reply.code(response.status);
       response.headers.forEach((value, key) => { reply.header(key, value); });
-      return reply.send(Buffer.from(await response.arrayBuffer()));
+      const body = Buffer.from(await response.arrayBuffer());
+      // The MCP SDK currently exposes extension fields through _meta only.
+      // ChatGPT needs per-tool securitySchemes; attach these to the JSON list result.
+      if (config.oauth && (request.body as { method?: string })?.method === 'tools/list' && response.status === 200) {
+        const result = JSON.parse(body.toString());
+        for (const tool of result.result?.tools || []) {
+          tool.securitySchemes = [{ type: 'oauth2', scopes: ['dayflow:read'] }];
+          tool._meta = { ...tool._meta, securitySchemes: tool.securitySchemes };
+        }
+        return reply.send(result);
+      }
+      return reply.send(body);
     } finally { await server.close(); }
   });
   for (const method of ['GET', 'DELETE'] as const) {

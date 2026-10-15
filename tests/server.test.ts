@@ -8,6 +8,7 @@ import { Pool } from 'pg';
 import sharp from 'sharp';
 import { createApp, todayInZone } from '../server/app.ts';
 import { digest } from '../server/security.ts';
+import { testDatabaseUrl, verifyTestDatabase } from './isolation.ts';
 
 test('Dayflow day boundary respects local calendar and DST', () => {
   assert.equal(todayInZone('Asia/Shanghai', 4, new Date('2026-09-16T19:59:00Z')), '2026-09-16');
@@ -16,11 +17,12 @@ test('Dayflow day boundary respects local calendar and DST', () => {
 });
 
 test('Authenticated sync, reconciliation, archive and screenshot lifecycle', async t => {
-  assert.ok(process.env.DATABASE_URL, 'DATABASE_URL is required');
-  const admin = new Pool({ connectionString: process.env.DATABASE_URL });
+  const databaseUrl = testDatabaseUrl();
+  const admin = new Pool({ connectionString: databaseUrl });
+  await verifyTestDatabase(admin);
   const schema = `test_${randomUUID().replaceAll('-', '')}`;
   await admin.query(`CREATE SCHEMA ${schema}`);
-  const url = new URL(process.env.DATABASE_URL!); url.searchParams.set('options', `-c search_path=${schema}`);
+  const url = new URL(databaseUrl); url.searchParams.set('options', `-c search_path=${schema}`);
   const storage = await mkdtemp(path.join(tmpdir(), 'dayflow-tests-'));
   const config = { databaseUrl: url.toString(), storageDir: storage, adminUsername: 'test', adminPassword: 'a-long-test-password',
     syncToken: 's'.repeat(48), readToken: 'r'.repeat(48), publicOrigin: 'http://127.0.0.1:4310', production: false, trustProxy: false, logger: false };

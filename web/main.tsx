@@ -6,6 +6,7 @@ import { Activity as ActivityIcon, ArrowLeft, ArrowRight, CalendarDays, Check, C
 import { api, Activity, Overview, screenshotURL } from './api';
 import './style.css';
 import './casdoor.css';
+import { SyncSettings } from './SyncSettings';
 
 const duration = (minutes: number) => minutes >= 60 ? `${Math.floor(minutes / 60)}小时${Math.round(minutes % 60) ? ` ${Math.round(minutes % 60)}分` : ''}` : `${Math.round(minutes)}分钟`;
 const shiftDate = (date: string, offset: number) => { const d = new Date(`${date}T12:00:00Z`); d.setUTCDate(d.getUTCDate() + offset); return d.toISOString().slice(0, 10); };
@@ -161,7 +162,7 @@ function Workspace({ onLogout }: { onLogout: () => Promise<void> }) {
           </>}
           {route.view === 'daily' && <Daily data={overview?.daily || null} />}
           {route.view === 'weekly' && <Weekly data={overview?.weekly || null} color={color} />}
-          {route.view === 'status' && <Status overview={overview} />}
+          {route.view === 'status' && <><SyncSettings /><Status overview={overview} /></>}
         </section>
         {selected && <aside className="detail" aria-label="活动详情"><div className="detail-header"><span>活动详情</span><IconButton label="关闭详情" onClick={() => setSelected(null)}><X size={18} /></IconButton></div><div className="detail-content"><div className="detail-category"><span className="category-dot" style={{ background: color(selected.category) }} />{selected.category}{selected.source_deleted && <span className="archived-tag">源端已删除</span>}</div><h2>{selected.title}</h2><div className="detail-time"><CalendarDays size={14} />{dayLabel(selected.day)}<span>{time(selected.start)} – {time(selected.end)}</span></div><div className="detail-duration"><Clock3 size={14} />{duration(selected.duration_minutes)}</div>
           <button className="screenshot-button" disabled={!selected.has_screenshot} onClick={() => setImageOpen(true)} aria-label="放大截图"><Screenshot key={`${selected.device_id}-${selected.record_id}`} item={selected} className="detail-screenshot" />{selected.has_screenshot && <span><Maximize2 size={16} /></span>}</button>

@@ -41,3 +41,23 @@ test('Production permits HTTP only for the configured internal IPv4 ranges', () 
     }
   }
 });
+
+test('OAuth configuration fails closed for missing identity/client/callback and insecure URLs', async () => {
+  const { fixtureConfig } = await import('./isolation.ts');
+  const { validateOAuth } = await import('../server/config.ts');
+  const config = fixtureConfig('/tmp/fictional-storage', 'postgresql://fixture@localhost/unused');
+  assert.doesNotThrow(() => validateOAuth(config));
+  for (const oauth of [
+    { ...config.oauth!, ownerUsername: '' }, { ...config.oauth!, clientId: '' }, { ...config.oauth!, redirectUris: [] },
+    { ...config.oauth!, redirectUris: ['https://client.example/*'] }, { ...config.oauth!, redirectUris: ['http://client.example/callback'] },
+    { ...config.oauth!, redirectUris: ['https://client.example/callback#fragment'] }, { ...config.oauth!, redirectUris: ['https://user:pass@client.example/callback'] },
+    { ...config.oauth!, accessTokenSeconds: 0 }, { ...config.oauth!, codeSeconds: 301 }, { ...config.oauth!, grantSeconds: 1 },
+    { ...config.oauth!, clientSecret: 'replace-with-production-secret' },
+  ]) assert.throws(() => validateOAuth({ ...config, oauth }));
+  assert.throws(() => validateOAuth({ ...config, production: true }));
+  assert.throws(() => validateOAuth({ ...config, publicOrigin: 'http://192.168.1.10', production: true }));
+  assert.throws(() => validateOAuth({ ...config, publicOrigin: 'http://public.example.com' }));
+  assert.throws(() => validateOAuth({ ...config, publicOrigin: 'https://dayflow.example.com/' }));
+  assert.throws(() => validateOAuth({ ...config, publicOrigin: 'https://user:password@dayflow.example.com' }));
+  assert.doesNotThrow(() => validateOAuth({ ...config, production: true, publicOrigin: 'https://dayflow.example.com' }));
+});

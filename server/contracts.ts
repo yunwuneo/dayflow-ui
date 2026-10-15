@@ -16,7 +16,7 @@ export const activity = z.object({
 const category = z.object({ name: z.string().max(500), color_hex: z.string().regex(/^#[a-fA-F0-9]{6}$/), is_idle: z.boolean(), is_system: z.boolean() });
 const document = z.object({ date, source_hash: hash, document: z.record(z.string(), z.unknown()).nullable() });
 export const batch = z.object({
-  device_id: z.uuid(), device_name: z.string().min(1).max(200), batch_id: z.uuid(),
+  device_id: z.uuid().toLowerCase(), device_name: z.string().min(1).max(200), batch_id: z.uuid(),
   expected_revision: z.number().int().nonnegative(),
   time_zone: z.string().refine(value => { try { new Intl.DateTimeFormat('en', { timeZone: value }); return true; } catch { return false; } }),
   day_boundary_hour: z.number().int().min(0).max(23),

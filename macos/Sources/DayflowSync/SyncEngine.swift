@@ -65,6 +65,9 @@ actor SyncEngine {
             }
             throw SyncFailure("无法连接服务器")
         }
+        progress("核对同步方式")
+        var manifest = try await request("sync/state?device_id=\(settings.deviceID)")
+        guard manifest["paused"] as? Bool != true else { throw SyncFailure("所有同步方式均已关闭，请在网页同步设置中开启") }
         if FileManager.default.fileExists(atPath: pendingURL.path) {
             progress("恢复上次未确认的同步批次")
             do { _ = try await request("sync/batch", method: "POST", data: Data(contentsOf: pendingURL)) }
@@ -72,9 +75,9 @@ actor SyncEngine {
                 // A different confirmed revision requires a fresh authoritative snapshot.
             }
             try FileManager.default.removeItem(at: pendingURL)
+            manifest = try await request("sync/state?device_id=\(settings.deviceID)")
         }
         progress("核对服务端同步清单")
-        let manifest = try await request("sync/state?device_id=\(settings.deviceID)")
         var revision = manifest["revision"] as? Int ?? 0
         var remoteDays: [String: String] = [:]
         for item in manifest["days"] as? [JSON] ?? [] { if let day = item["day"] as? String { remoteDays[day] = item["source_hash"] as? String } }
