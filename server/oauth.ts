@@ -15,7 +15,9 @@ const authorizationQuery = z.object({
   client_id: z.string().min(1).max(200), redirect_uri: z.string().max(2048), response_type: z.literal('code'),
   scope: z.string().min(1).max(200), resource: z.string().max(2048), state: z.string().regex(/^[\x20-\x7e]{1,512}$/),
   code_challenge: z.string().regex(/^[A-Za-z0-9_-]{43}$/), code_challenge_method: z.literal('S256'),
-}).strict();
+// RFC 6749 section 3.1: ignore unrecognized authorization parameters.
+// Strip them before persisting or passing the request to the OAuth engine.
+}).strip();
 function page(title: string, content: string) {
   return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${esc(title)} · Dayflow</title>
   <style>body{margin:0;background:#f4f6f5;color:#203b35;font:16px/1.7 system-ui}main{max-width:560px;margin:8vh auto;padding:30px;background:white;border-radius:20px;box-shadow:0 8px 40px #203b3510}h1{font-size:25px}label{display:block;margin:14px 0}input{display:block;box-sizing:border-box;width:100%;padding:12px;border:1px solid #b8c6c0;border-radius:8px;font:inherit}button,a{font:inherit}button{cursor:pointer;border:0;border-radius:9px;padding:12px 18px;background:#246c54;color:white;margin:8px 8px 8px 0}button.secondary{background:#e7ede9;color:#203b35}p,li{overflow-wrap:anywhere}.error{color:#9a2323}@media(max-width:640px){main{margin:20px;padding:24px}}</style>
@@ -176,7 +178,7 @@ export function createOAuth(app: FastifyInstance, pool: Pool, config: Config, au
       };
       const details = [...new Set(parsed.error.issues.map(issue => {
         const field = String(issue.path[0]);
-        return rules[field] ? `${field}: ${rules[field]}` : 'Only documented authorization parameters are accepted';
+        return rules[field] ? `${field}: ${rules[field]}` : 'Invalid authorization parameter';
       }))];
       throw invalid('InvalidRequestError', `Invalid authorization parameters: ${details.join('; ')}`);
     }

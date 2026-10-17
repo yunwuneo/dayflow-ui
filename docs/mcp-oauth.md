@@ -22,7 +22,7 @@
 
 1. 未认证的 `/mcp` 返回 401，`WWW-Authenticate` 指向 `/.well-known/oauth-protected-resource/mcp`，要求 `dayflow:read`。浏览器 Cookie、同步令牌、URL/body token 均不能代替 MCP Authorization header。
 2. protected-resource metadata 中 resource 为 `PUBLIC_ORIGIN + /mcp`，issuer 为 `PUBLIC_ORIGIN`。`/.well-known/oauth-authorization-server` 发布 authorize/token/revoke、S256、scope 和客户端认证方式。无路径的 protected-resource metadata 也返回相同 resource。
-3. `/oauth/authorize` 严格校验预注册 client_id、精确 HTTPS redirect_uri、response_type=code、resource、scope、state、S256 challenge。错误配置/请求安全拒绝，无法确认合法回调时在本地报错，不向不受信任地址跳转。
+3. `/oauth/authorize` 严格校验预注册 client_id、精确 HTTPS redirect_uri、response_type=code、resource、scope、state、S256 challenge。按 [RFC 6749 §3.1](https://www.rfc-editor.org/rfc/rfc6749#section-3.1) 忽略未知授权参数；额外字段不保存到授权意图、不传给 OAuth 引擎，也不能代替登录和用户确认。错误配置/请求安全拒绝，无法确认合法回调时在本地报错，不向不受信任地址跳转。
 4. 没有会话时显示原生用户名密码登录页；复用 scrypt 密码验证、users/sessions 表和 HttpOnly 原生会话 Cookie，不向客户端发送密码。密码验证及创建会话持有账号共享锁，和密码重置串行。
 5. 显示服务端会话账号、配置中的客户端名称、读取范围及续期说明。只有 `MCP_OWNER_USERNAME` 指定的真实会话用户可以同意授权。授权页面 CSP 仅允许同源表单及已配置的 HTTPS 回调来源（Chrome 会检查重定向链），完整回调 URI 仍由服务端精确匹配；同源 Referrer-Policy 防止跨站泄露并保留合法表单 Origin。POST 确认依据数据库查出的会话身份，不接受前端提供的用户名；同意/拒绝均需 Origin、浏览器绑定的 interaction Cookie 和一次性持久化 CSRF 校验。
 6. 同意创建持久化 grant 和短期 code；拒绝返回 access_denied，不创建 grant。成功和拒绝重定向均携带 state 和正确的 iss。授权码交换的资源必须精确匹配；库验证客户端、回调、期限和 PKCE。事务、grant 行锁及原子 UPDATE 保证并发只能消费一次；错误 PKCE 也消费码。
@@ -96,6 +96,8 @@ MCP_OAUTH_CODE_SECONDS=120
 OAuth 错误响应包含 `error`、`error_description`、适用时的 `hint` 和 `request_id`，响应头同时提供 `X-Request-ID`。浏览器以 HTML 打开授权、登录或确认端点时，会显示相同信息的错误页；token/revoke 端点始终返回 JSON。无效回调仍在本地报错，不向未注册地址跳转。
 
 例如 `invalid_request` 的详情会指出 `code_challenge_method: must be S256`、缺少 `state`，或 `resource` 应为 `PUBLIC_ORIGIN + /mcp`。`invalid_client` 会区分 Client ID 与回调地址不匹配。检查客户端请求与服务端配置后，从客户端重新发起授权。
+
+旧版本的 `Only documented authorization parameters are accepted` 表示请求含额外字段，被旧的严格对象校验拒绝。更新后忽略未知字段，仍校验必填参数和重复的已知参数；无需删除客户端附带的扩展参数。具体额外字段无法仅从此旧错误判断，不应据此猜测或记录完整授权 URL。
 
 启用应用日志时，按 `event=oauth_failure` 和 `request_id` 查找对应记录，可看到端点、状态码和安全错误说明。不会记录原始 query、请求正文、凭据或内部异常文本。500 错误只返回通用说明，应结合数据库与服务运行状态排查。反馈问题时提供错误代码、详情和请求编号，不要提供完整授权 URL、授权码、令牌或 Client Secret。
 

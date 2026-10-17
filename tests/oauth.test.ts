@@ -122,7 +122,7 @@ test('OAuth authorization, persistence, scope separation and replay protection (
     for (const overrides of [{ client_id: 'unknown' }, { redirect_uri: 'https://attacker.example/callback' }, { redirect_uri: callback + '?evil=1' },
       { resource: 'https://wrong.example/mcp' }, { scope: 'dayflow:write' }, { scope: 'dayflow:read dayflow:read' }, { scope: 'openid' },
       { code_challenge_method: 'plain' }, { code_challenge_method: '' }, { code_challenge: '' }, { state: '' }]) {
-      const response = await app.inject('/oauth/authorize?' + new URLSearchParams({ ...query(p.challenge), ...overrides }));
+      const response = await app.inject('/oauth/authorize?' + new URLSearchParams({ ...query(p.challenge), prompt: 'consent', nonce: 'fictional-nonce', ...overrides }));
       assert.ok(response.statusCode >= 400, response.body); assert.equal(response.headers.location, undefined);
     }
     assert.equal((await app.inject(`/oauth/authorize?${new URLSearchParams(query(p.challenge))}&resource=evil`)).statusCode, 400);
@@ -137,7 +137,6 @@ test('OAuth authorization, persistence, scope separation and replay protection (
       [{ redirect_uri: 'https://evil.example/sensitive-unregistered-value' }, /redirect_uri.*MCP_OAUTH_REDIRECT_URIS/],
       [{ resource: 'sensitive-unregistered-value' }, /resource must equal/],
       [{ scope: 'sensitive-unregistered-value' }, /scope must include dayflow:read/],
-      [{ unexpected: 'sensitive-unregistered-value' }, /Only documented/],
     ] as [Record<string, string>, RegExp][]) {
       const response = await app.inject('/oauth/authorize?' + new URLSearchParams({ ...query(p.challenge), ...overrides }));
       assert.equal(response.statusCode, 400);
@@ -154,7 +153,28 @@ test('OAuth authorization, persistence, scope separation and replay protection (
     assert.match(duplicate.json().error_description, /重复/);
     assert.ok(duplicate.json().request_id);
   });
+  await t.test('Extra authorization parameters are stripped while login, consent and token exchange still work', async () => {
+    // Representative optional/unknown fields, not a captured ChatGPT request.
+    const extras = { prompt: 'consent', nonce: 'fictional-sensitive-nonce', id_token_hint: 'fictional-sensitive-hint',
+      unexpected: 'fictional-sensitive-value', allowed: 'true', username: owner };
+    const anonymous = await begin('', extras);
+    assert.match(anonymous.page, /登录以继续授权/);
+    assert.equal((await decision(anonymous)).statusCode, 401);
+    const flow = await begin(ownerCookie, extras);
+    assert.match(flow.page, /同意只读访问/);
+    const stored = await pool.query('SELECT parameters FROM mcp_oauth_interactions WHERE id_hash=$1', [digest(flow.id)]);
+    assert.deepEqual(stored.rows[0].parameters, query(flow.challenge));
+    assert.ok(!flow.page.includes('fictional-sensitive'));
+    const denied = await decision(flow, false);
+    assert.equal(denied.statusCode, 302);
+    assert.equal(new URL(String(denied.headers.location)).searchParams.get('error'), 'access_denied');
+    const c = await code(extras);
+    const response = await exchange(c);
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal((await rpc(response.json().access_token)).statusCode, 200);
+  });
   await t.test('Native credentials login within OAuth, explicit consent and denial', async () => {
+    const grantsBefore = (await pool.query('SELECT count(*)::int AS n FROM mcp_oauth_grants')).rows[0].n;
     const flow = await begin(''); assert.match(flow.page, /登录以继续授权/);
     const response = await formPost('/oauth/login', { id: flow.id, csrf: flow.csrf, username: owner, password: config.adminPassword }, { cookie: flow.cookie, origin: config.publicOrigin });
     assert.equal(response.statusCode, 200, response.body); assert.match(response.body, /同意只读访问/);
@@ -164,7 +184,7 @@ test('OAuth authorization, persistence, scope separation and replay protection (
     const denied = await decision({ ...flow, cookie: `${flow.cookie}; ${session}` }, false);
     assert.equal(denied.statusCode, 302, denied.body);
     const location = new URL(String(denied.headers.location)); assert.equal(location.searchParams.get('error'), 'access_denied'); assert.equal(location.searchParams.get('iss'), config.publicOrigin);
-    assert.equal((await pool.query('SELECT count(*)::int AS n FROM mcp_oauth_grants')).rows[0].n, 0);
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM mcp_oauth_grants')).rows[0].n, grantsBefore);
     const newFlow = await begin('');
     const wrong = await formPost('/oauth/login', { id: newFlow.id, csrf: newFlow.csrf, username: owner, password: 'wrong' }, { cookie: newFlow.cookie, origin: config.publicOrigin });
     assert.equal(wrong.statusCode, 401);
