@@ -8,10 +8,41 @@ import { Pool } from 'pg';
 import sharp from 'sharp';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import Fastify from 'fastify';
+import OAuth2Server from '@node-oauth/oauth2-server';
+import { Writable } from 'node:stream';
+import { oauthFailure } from '../server/oauth.ts';
 import { createApp } from '../server/app.ts';
 import { digest, hashPassword } from '../server/security.ts';
 import { resetPassword } from '../server/password.ts';
 import { fixtureConfig, testDatabaseUrl, verifyTestDatabase } from './isolation.ts';
+
+test('OAuth diagnostics correlate responses and safe logs without exposing internal errors', async () => {
+  let logs = '';
+  const app = Fastify({ logger: { stream: new Writable({ write(chunk, _encoding, done) { logs += chunk.toString(); done(); } }) } });
+  app.get('/oauth/authorize', (_request, reply) => oauthFailure(new OAuth2Server.InvalidRequestError('code_challenge_method must be S256'), reply));
+  app.post('/oauth/token', (_request, reply) => oauthFailure(new Error('secret-database-password'), reply));
+  try {
+    const response = await app.inject('/oauth/authorize');
+    assert.equal(response.statusCode, 400);
+    assert.equal(response.json().error, 'invalid_request');
+    assert.match(response.json().error_description, /code_challenge_method.*S256/);
+    assert.equal(response.json().request_id, response.headers['x-request-id']);
+    assert.equal(response.headers['cache-control'], 'no-store');
+    const html = await app.inject({ url: '/oauth/authorize', headers: { accept: 'text/html' } });
+    assert.match(String(html.headers['content-type']), /text\/html/);
+    assert.match(html.body, /OAuth 授权失败/);
+    assert.ok(html.body.includes(String(html.headers['x-request-id'])));
+    const internal = await app.inject({ method: 'POST', url: '/oauth/token', headers: { accept: 'text/html' } });
+    assert.equal(internal.statusCode, 500);
+    assert.equal(internal.json().error, 'server_error');
+    assert.match(internal.json().error_description, /请求编号/);
+    const diagnostic = logs.split('\n').filter(Boolean).map(line => JSON.parse(line)).find(line => line.event === 'oauth_failure' && line.status === 500);
+    assert.equal(diagnostic.request_id, internal.json().request_id);
+    assert.ok(!logs.includes('secret-database-password'));
+    assert.ok(!internal.body.includes('secret-database-password'));
+  } finally { await app.close(); }
+});
 
 test('OAuth authorization, persistence, scope separation and replay protection (fictional database)', async t => {
   const admin = new Pool({ connectionString: testDatabaseUrl() });
@@ -95,6 +126,33 @@ test('OAuth authorization, persistence, scope separation and replay protection (
       assert.ok(response.statusCode >= 400, response.body); assert.equal(response.headers.location, undefined);
     }
     assert.equal((await app.inject(`/oauth/authorize?${new URLSearchParams(query(p.challenge))}&resource=evil`)).statusCode, 400);
+  });
+  await t.test('Authorization errors identify fields without reflecting request values', async () => {
+    const p = pkce();
+    for (const [overrides, expected] of [
+      [{ code_challenge_method: 'plain' }, /code_challenge_method: must be S256/],
+      [{ code_challenge: '' }, /code_challenge:/],
+      [{ state: '' }, /state:/],
+      [{ client_id: 'sensitive-unregistered-value' }, /client_id.*MCP_OAUTH_CLIENT_ID/],
+      [{ redirect_uri: 'https://evil.example/sensitive-unregistered-value' }, /redirect_uri.*MCP_OAUTH_REDIRECT_URIS/],
+      [{ resource: 'sensitive-unregistered-value' }, /resource must equal/],
+      [{ scope: 'sensitive-unregistered-value' }, /scope must include dayflow:read/],
+      [{ unexpected: 'sensitive-unregistered-value' }, /Only documented/],
+    ] as [Record<string, string>, RegExp][]) {
+      const response = await app.inject('/oauth/authorize?' + new URLSearchParams({ ...query(p.challenge), ...overrides }));
+      assert.equal(response.statusCode, 400);
+      assert.match(response.json().error_description, expected);
+      assert.equal(response.headers.location, undefined);
+      assert.ok(!response.body.includes('sensitive-unregistered-value'));
+      assert.ok(response.json().request_id);
+    }
+    const missingCode = await formPost('/oauth/token', { grant_type: 'authorization_code', client_id: clientId, resource });
+    assert.equal(missingCode.json().error, 'invalid_request');
+    assert.match(missingCode.json().error_description, /Missing parameter: `code`/);
+    const duplicate = await app.inject({ method: 'POST', url: '/oauth/token', headers: { 'content-type': 'application/x-www-form-urlencoded' }, payload: 'client_id=one&client_id=two' });
+    assert.equal(duplicate.json().error, 'invalid_request');
+    assert.match(duplicate.json().error_description, /重复/);
+    assert.ok(duplicate.json().request_id);
   });
   await t.test('Native credentials login within OAuth, explicit consent and denial', async () => {
     const flow = await begin(''); assert.match(flow.page, /登录以继续授权/);

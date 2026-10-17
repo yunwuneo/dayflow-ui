@@ -14,7 +14,7 @@ import { registerNotion } from './notion.ts';
 import { enqueueBatch, preferences } from './notion-sync.ts';
 import { NotionAPI, NotionError } from './notion-api.ts';
 import { nativeAuth, failure } from './auth.ts';
-import { createOAuth } from './oauth.ts';
+import { createOAuth, oauthFailure } from './oauth.ts';
 import { batch as batchSchema, date as dateSchema } from './contracts.ts';
 import { registerMcp } from './mcp.ts';
 import { activityFilters, getActivity, getOverview, getScreenshotHash, searchActivities } from './queries.ts';
@@ -50,6 +50,7 @@ export async function createApp(config: Config, options: { notionApi?: NotionAPI
   let notion: ReturnType<typeof registerNotion>;
   app.addHook('onClose', async () => { await notion?.stop(); await pool.end(); });
   app.setErrorHandler((error, request, reply) => {
+    if (config.oauth && request.routeOptions.url?.startsWith('/oauth/')) return oauthFailure(error, reply);
     if (error instanceof NotionError) return reply.code(502).send({ error: error.message });
     if (error instanceof ZodError) return reply.code(400).send({ error: '请求格式不正确', details: error.issues.map(i => i.path.join('.') + ': ' + i.message) });
     const typed = error as Error & { statusCode?: number };

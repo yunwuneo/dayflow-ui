@@ -91,6 +91,14 @@ MCP_OAUTH_CODE_SECONDS=120
 - 密码重置仍针对 ADMIN_USERNAME。若 owner 与管理员不同，应在受保护环境中明确选择重置账号，不能误重置管理员或仅修改环境变量。本轮仅测试虚构账号重置，没有操作实际账号。
 - 普通注销只撤销浏览器会话，不撤销已明确授予客户端的授权；客户端长期授权通过上述管理入口单独撤销。
 
+## OAuth 错误排查
+
+OAuth 错误响应包含 `error`、`error_description`、适用时的 `hint` 和 `request_id`，响应头同时提供 `X-Request-ID`。浏览器以 HTML 打开授权、登录或确认端点时，会显示相同信息的错误页；token/revoke 端点始终返回 JSON。无效回调仍在本地报错，不向未注册地址跳转。
+
+例如 `invalid_request` 的详情会指出 `code_challenge_method: must be S256`、缺少 `state`，或 `resource` 应为 `PUBLIC_ORIGIN + /mcp`。`invalid_client` 会区分 Client ID 与回调地址不匹配。检查客户端请求与服务端配置后，从客户端重新发起授权。
+
+启用应用日志时，按 `event=oauth_failure` 和 `request_id` 查找对应记录，可看到端点、状态码和安全错误说明。不会记录原始 query、请求正文、凭据或内部异常文本。500 错误只返回通用说明，应结合数据库与服务运行状态排查。反馈问题时提供错误代码、详情和请求编号，不要提供完整授权 URL、授权码、令牌或 Client Secret。
+
 ## 测试与本轮边界
 
 `npm test` 和 `npm run test:ui` 都不加载 `.env`，会清除继承的数据库/认证配置，使用本机已有 PostgreSQL 工具创建 disposable cluster、仅监听临时 Unix socket，创建 dayflow_isolated_test 数据库。测试入口在连接前校验临时 URL/用户名/socket/标记，连接后复核 data_directory。原有集成测试也在这个实例中的随机 schema 运行。

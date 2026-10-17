@@ -2,7 +2,7 @@ import OAuth2Server from '@node-oauth/oauth2-server';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { Pool, PoolClient } from 'pg';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { z } from 'zod';
+import { z, ZodError } from 'zod';
 import type { Config } from './config.ts';
 import type { NativeAuth } from './auth.ts';
 import { failure } from './auth.ts';
@@ -21,9 +21,39 @@ function page(title: string, content: string) {
   <style>body{margin:0;background:#f4f6f5;color:#203b35;font:16px/1.7 system-ui}main{max-width:560px;margin:8vh auto;padding:30px;background:white;border-radius:20px;box-shadow:0 8px 40px #203b3510}h1{font-size:25px}label{display:block;margin:14px 0}input{display:block;box-sizing:border-box;width:100%;padding:12px;border:1px solid #b8c6c0;border-radius:8px;font:inherit}button,a{font:inherit}button{cursor:pointer;border:0;border-radius:9px;padding:12px 18px;background:#246c54;color:white;margin:8px 8px 8px 0}button.secondary{background:#e7ede9;color:#203b35}p,li{overflow-wrap:anywhere}.error{color:#9a2323}@media(max-width:640px){main{margin:20px;padding:24px}}</style>
   <main><p>Dayflow Archive</p><h1>${esc(title)}</h1>${content}</main></html>`;
 }
-function oauthFailure(error: unknown, reply: FastifyReply) {
-  if (error instanceof OAuth2Server.OAuthError) return reply.code(error.code >= 500 ? 500 : error.code).send({ error: error.code >= 500 ? 'server_error' : error.name });
-  throw error;
+export function oauthFailure(error: unknown, reply: FastifyReply) {
+  const request = reply.request;
+  const typed = error as { statusCode?: number };
+  const status = error instanceof ZodError ? 400 : error instanceof OAuth2Server.OAuthError ? error.code : typed?.statusCode || 500;
+  const serverError = status >= 500;
+  const code = serverError ? 'server_error' : error instanceof OAuth2Server.OAuthError ? error.name : 'invalid_request';
+  // OAuth library 4xx messages describe protocol checks, never token values.
+  // Never expose/log arbitrary internal errors, request bodies or query strings.
+  const description = serverError ? 'OAuth 服务暂时不可用，请使用请求编号检查服务端日志和数据库状态。'
+    : error instanceof OAuth2Server.OAuthError ? error.message
+    : error instanceof ZodError ? '请求字段缺失或格式不正确，请检查表单字段及参数类型。'
+    : status === 429 ? '授权请求过于频繁，请稍后重试。'
+    : status === 403 ? '授权来源、浏览器状态或权限校验失败；请在同一浏览器重新发起授权并检查登录账号。'
+    : status === 401 ? '登录会话无效，请登录后重新发起授权。'
+    : status === 413 ? '授权请求过大，请减少请求参数。'
+    : '请求格式不正确，请使用 application/x-www-form-urlencoded，且不要重复提交同名参数。';
+  const hints: Record<string, string> = {
+    invalid_request: '检查提示中的参数；授权需要 response_type=code、state、resource 和 PKCE S256。',
+    invalid_client: '核对 MCP_OAUTH_CLIENT_ID、MCP_OAUTH_REDIRECT_URIS 和客户端认证方式；回调地址必须完全匹配。',
+    invalid_scope: 'scope 必须包含 dayflow:read，可选 offline_access；不能包含其他或重复权限。',
+    invalid_grant: '授权码可能已使用、过期，或 PKCE/回调地址不匹配；请重新授权。刷新令牌失效也需要重新授权。',
+    unsupported_grant_type: 'grant_type 仅支持 authorization_code 或 refresh_token。',
+  };
+  const result = { error: code, error_description: description, ...(hints[code] ? { hint: hints[code] } : {}), request_id: request.id };
+  const diagnostic = { event: 'oauth_failure', endpoint: request.routeOptions.url, status, ...result };
+  if (serverError) request.log.error(diagnostic, 'OAuth request failed');
+  else request.log.warn(diagnostic, 'OAuth request rejected');
+  reply.code(serverError ? 500 : status).header('Cache-Control', 'no-store').header('Pragma', 'no-cache').header('X-Request-ID', request.id);
+  const endpoint = request.routeOptions.url || '';
+  if (['/oauth/authorize', '/oauth/login', '/oauth/decision'].includes(endpoint) && request.headers.accept?.includes('text/html')) {
+    return reply.type('text/html').send(page('OAuth 授权失败', `<p class="error" role="alert">${esc(description)}</p><p>错误代码：${esc(code)}</p>${result.hint ? `<p>${esc(result.hint)}</p>` : ''}<p>请求编号：<code>${esc(request.id)}</code></p><p>请保留错误代码和请求编号以便排查，然后从客户端重新发起授权。</p>`));
+  }
+  return reply.send(result);
 }
 const invalid = (name: 'InvalidRequestError' | 'InvalidClientError' | 'InvalidScopeError' | 'InvalidGrantError', text: string) => new OAuth2Server[name](text);
 
@@ -137,11 +167,24 @@ export function createOAuth(app: FastifyInstance, pool: Pool, config: Config, au
   });
   const parameters = (input: unknown) => {
     const parsed = authorizationQuery.safeParse(input);
-    if (!parsed.success) throw invalid('InvalidRequestError', 'Invalid authorization parameters; PKCE S256 is required');
+    if (!parsed.success) {
+      const rules: Record<string, string> = {
+        client_id: 'required, at most 200 characters', redirect_uri: 'required, at most 2048 characters',
+        response_type: 'must be code', scope: 'required, at most 200 characters', resource: 'required, at most 2048 characters',
+        state: 'required, 1-512 printable ASCII characters', code_challenge: 'must be a 43-character base64url SHA-256 challenge',
+        code_challenge_method: 'must be S256',
+      };
+      const details = [...new Set(parsed.error.issues.map(issue => {
+        const field = String(issue.path[0]);
+        return rules[field] ? `${field}: ${rules[field]}` : 'Only documented authorization parameters are accepted';
+      }))];
+      throw invalid('InvalidRequestError', `Invalid authorization parameters: ${details.join('; ')}`);
+    }
     const q = parsed.data;
-    if (!checkClient(q.client_id, null, true) || !o.redirectUris.includes(q.redirect_uri)) throw invalid('InvalidClientError', 'Client or redirect URI is not registered');
-    if (q.resource !== resource) throw invalid('InvalidRequestError', 'Invalid resource');
-    if (!validScopes(q.scope.split(' '))) throw invalid('InvalidScopeError', 'Invalid scope');
+    if (!checkClient(q.client_id, null, true)) throw invalid('InvalidClientError', 'client_id does not match MCP_OAUTH_CLIENT_ID');
+    if (!o.redirectUris.includes(q.redirect_uri)) throw invalid('InvalidClientError', 'redirect_uri must exactly match an entry in MCP_OAUTH_REDIRECT_URIS');
+    if (q.resource !== resource) throw invalid('InvalidRequestError', `resource must equal ${resource}`);
+    if (!validScopes(q.scope.split(' '))) throw invalid('InvalidScopeError', 'scope must include dayflow:read; only dayflow:read and offline_access are supported, without duplicates');
     return q;
   };
   const fields = (id: string, csrf: string) => `<input type="hidden" name="id" value="${esc(id)}"><input type="hidden" name="csrf" value="${esc(csrf)}">`;
@@ -231,7 +274,7 @@ export function createOAuth(app: FastifyInstance, pool: Pool, config: Config, au
       const body = z.record(z.string(), z.string().max(4096)).parse(request.body);
       const creds = clientCredentials(request, body);
       if (!['authorization_code', 'refresh_token'].includes(body.grant_type)) throw new OAuth2Server.UnsupportedGrantTypeError('Only authorization_code and refresh_token are supported');
-      if (body.resource !== resource) throw invalid('InvalidRequestError', 'Invalid resource');
+      if (body.resource !== resource) throw invalid('InvalidRequestError', `resource must equal ${resource}`);
       if (body.scope && !validScopes(body.scope.split(' '))) throw invalid('InvalidScopeError', 'Invalid scope');
       if (body.grant_type === 'authorization_code' && body.scope) throw invalid('InvalidRequestError', 'Authorization code scope cannot be changed at exchange');
       await db.query('BEGIN'); begun = true;
