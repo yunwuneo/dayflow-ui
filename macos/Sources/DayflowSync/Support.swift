@@ -62,8 +62,27 @@ struct Settings: Codable {
     var deviceName = Host.current().localizedName ?? "My Mac"
     var cliPath = "/usr/local/bin/dayflow"
     var databasePath = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Dayflow/chunks.sqlite").path
+    var dailyBriefDirectory = Settings.defaultDailyBriefDirectory
     var intervalMinutes = 30
     var paused = false
+    static var defaultDailyBriefDirectory: String {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Dayflow/daily_brief", isDirectory: true).path
+    }
+    enum CodingKeys: String, CodingKey {
+        case serverURL, deviceID, deviceName, cliPath, databasePath, dailyBriefDirectory, intervalMinutes, paused
+    }
+    init() {}
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        serverURL = try container.decodeIfPresent(String.self, forKey: .serverURL) ?? serverURL
+        deviceID = try container.decodeIfPresent(String.self, forKey: .deviceID) ?? deviceID
+        deviceName = try container.decodeIfPresent(String.self, forKey: .deviceName) ?? deviceName
+        cliPath = try container.decodeIfPresent(String.self, forKey: .cliPath) ?? cliPath
+        databasePath = try container.decodeIfPresent(String.self, forKey: .databasePath) ?? databasePath
+        dailyBriefDirectory = try container.decodeIfPresent(String.self, forKey: .dailyBriefDirectory) ?? Self.defaultDailyBriefDirectory
+        intervalMinutes = try container.decodeIfPresent(Int.self, forKey: .intervalMinutes) ?? intervalMinutes
+        paused = try container.decodeIfPresent(Bool.self, forKey: .paused) ?? paused
+    }
     static var directory: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/DayflowSync", isDirectory: true)
     }

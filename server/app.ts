@@ -15,9 +15,9 @@ import { enqueueBatch, preferences } from './notion-sync.ts';
 import { NotionAPI, NotionError } from './notion-api.ts';
 import { nativeAuth, failure } from './auth.ts';
 import { createOAuth, oauthFailure } from './oauth.ts';
-import { batch as batchSchema, date as dateSchema } from './contracts.ts';
+import { batch as batchSchema, briefFileName, date as dateSchema, lobehubSettingsInput } from './contracts.ts';
 import { registerMcp } from './mcp.ts';
-import { activityFilters, getActivity, getOverview, getScreenshotHash, searchActivities } from './queries.ts';
+import { activityFilters, getActivity, getDailyBrief, getDailyBriefImageHash, getLobehubSettings, getOverview, getScreenshotHash, saveLobehubSettings, searchActivities } from './queries.ts';
 import { constantEquals, digest, hashPassword, verifyPassword } from './security.ts';
 import { prepareScreenshotStorage, ScreenshotStorageError, storeScreenshot } from './storage.ts';
 
@@ -25,6 +25,7 @@ export { todayInZone } from './queries.ts';
 
 const uuidQuery = z.object({ device_id: z.uuid() });
 const activityParams = z.object({ device: z.uuid(), record: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER) });
+const briefImageParams = z.object({ device: z.uuid(), day: dateSchema, file: briefFileName });
 
 export async function createApp(config: Config, options: { notionApi?: NotionAPI; startNotionWorker?: boolean } = {}) {
   validateOAuth(config);
@@ -46,7 +47,7 @@ export async function createApp(config: Config, options: { notionApi?: NotionAPI
   app.decorateRequest('sessionUsername', null);
   const auth = nativeAuth(pool, config, dummyHash);
   const oauth = createOAuth(app, pool, config, auth);
-  app.addContentTypeParser('image/jpeg', { parseAs: 'buffer', bodyLimit: 3 * 1024 * 1024 }, (_req, body, done) => done(null, body));
+  app.addContentTypeParser(['image/jpeg', 'image/png', 'image/webp'], { parseAs: 'buffer', bodyLimit: 5 * 1024 * 1024 }, (_req, body, done) => done(null, body));
   let notion: ReturnType<typeof registerNotion>;
   app.addHook('onClose', async () => { await notion?.stop(); await pool.end(); });
   app.setErrorHandler((error, request, reply) => {
@@ -194,13 +195,25 @@ export async function createApp(config: Config, options: { notionApi?: NotionAPI
           days: days.rows, documents: items.rows.filter(i => i.kind !== 'activity').map(i => ({ kind: i.kind, day: i.day, source_hash: i.source_hash })),
           activities: items.rows.filter(i => i.kind === 'activity').map(i => ({ record_id: Number(i.key.split(':').at(-1)), day: i.day,
             content_hash: i.source_hash, source_deleted: i.source_deleted, has_screenshot: true })),
+          daily_briefs: [],
         };
       }
       const device = await client.query('SELECT revision FROM devices WHERE id=$1', [device_id]);
       const days = await client.query('SELECT day::text,source_hash FROM source_days WHERE device_id=$1', [device_id]);
       const documents = await client.query('SELECT kind,day::text,source_hash FROM documents WHERE device_id=$1', [device_id]);
       const activities = await client.query('SELECT record_id::float8,day::text,content_hash,source_deleted,screenshot_hash IS NOT NULL AS has_screenshot FROM activities WHERE device_id=$1', [device_id]);
-      return { revision: device.rows[0]?.revision || 0, ...prefs, paused: false, days: days.rows, documents: documents.rows, activities: activities.rows };
+      const briefs = await client.query('SELECT day::text,source_hash FROM daily_briefs WHERE device_id=$1', [device_id]);
+      const briefImages = await client.query('SELECT day::text,file_name FROM daily_brief_images WHERE device_id=$1', [device_id]);
+      const imagesByDay = new Map<string, string[]>();
+      for (const row of briefImages.rows) {
+        const list = imagesByDay.get(row.day) || [];
+        list.push(row.file_name);
+        imagesByDay.set(row.day, list);
+      }
+      return {
+        revision: device.rows[0]?.revision || 0, ...prefs, paused: false, days: days.rows, documents: documents.rows, activities: activities.rows,
+        daily_briefs: briefs.rows.map(row => ({ day: row.day, source_hash: row.source_hash, uploaded_images: imagesByDay.get(row.day) || [] })),
+      };
     } finally { await client.query('ROLLBACK'); client.release(); }
   });
   app.post('/api/v1/sync/batch', async request => {
@@ -240,6 +253,13 @@ export async function createApp(config: Config, options: { notionApi?: NotionAPI
             ON CONFLICT(device_id,kind,day) DO UPDATE SET source_hash=EXCLUDED.source_hash,payload=EXCLUDED.payload,updated_at=now()`,
           [data.device_id, kind, doc.date, doc.source_hash, doc.document]);
         }
+        for (const brief of data.daily_briefs) {
+          await client.query(`INSERT INTO daily_briefs(device_id,day,source_day,source,source_hash,generated_at,content,user_state,stats)
+            VALUES($1,$2,$3,'local_sync',$4,$5,$6,$7,$8)
+            ON CONFLICT(device_id,day) DO UPDATE SET source_day=EXCLUDED.source_day,source=EXCLUDED.source,source_hash=EXCLUDED.source_hash,
+            generated_at=EXCLUDED.generated_at,content=EXCLUDED.content,user_state=EXCLUDED.user_state,stats=EXCLUDED.stats,updated_at=now()`,
+          [data.device_id, brief.date, brief.source_day, brief.source_hash, brief.generated_at, brief.content, brief.user_state, brief.stats ?? null]);
+        }
       }
       const revision = data.expected_revision + 1;
       await client.query(`UPDATE devices SET name=$2,revision=$3,time_zone=$4,day_boundary_hour=$5,
@@ -256,7 +276,8 @@ export async function createApp(config: Config, options: { notionApi?: NotionAPI
   app.put('/api/v1/sync/activities/:device/:record/screenshot', async (request, reply) => {
     const { device, record } = activityParams.parse(request.params);
     if (!(await preferences(pool)).cloud_enabled) return { ok: true, skipped: true };
-    if (!Buffer.isBuffer(request.body)) throw failure(415, '截图必须为 JPEG');
+    if (!Buffer.isBuffer(request.body) || request.headers['content-type']?.split(';')[0].trim() !== 'image/jpeg') throw failure(415, '截图必须为 JPEG');
+    if (request.body.length > 3 * 1024 * 1024) throw failure(413, '截图大小超过限制');
     const exists = await pool.query('SELECT screenshot_hash FROM activities WHERE device_id=$1 AND record_id=$2', [device, record]);
     if (!exists.rowCount) throw failure(404, '活动不存在');
     if (exists.rows[0].screenshot_hash) return { ok: true };
@@ -270,10 +291,42 @@ export async function createApp(config: Config, options: { notionApi?: NotionAPI
     await pool.query('UPDATE activities SET screenshot_hash=$3 WHERE device_id=$1 AND record_id=$2 AND screenshot_hash IS NULL', [device, record, hash]);
     return reply.code(200).send({ ok: true });
   });
+  app.put('/api/v1/sync/daily-briefs/:device/:day/images/:file', async (request, reply) => {
+    const { device, day, file } = briefImageParams.parse(request.params);
+    if (!(await preferences(pool)).cloud_enabled) return { ok: true, skipped: true };
+    if (!Buffer.isBuffer(request.body)) throw failure(415, '简报图片必须为 JPEG/PNG/WebP');
+    const exists = await pool.query('SELECT 1 FROM daily_briefs WHERE device_id=$1 AND day=$2', [device, day]);
+    if (!exists.rowCount) throw failure(404, '对应日期的每日简报不存在');
+    let image: Buffer;
+    try {
+      image = await sharp(request.body, { limitInputPixels: 20_000_000 }).rotate().resize({ width: 1440, height: 1200, fit: 'inside', withoutEnlargement: true }).jpeg({ quality: 82 }).toBuffer();
+    } catch { throw failure(400, '简报图片无法解码'); }
+    const hash = digest(image);
+    await storeScreenshot(config.storageDir, hash, image);
+    await pool.query(`INSERT INTO daily_brief_images(device_id, day, file_name, image_hash) VALUES($1,$2,$3,$4)
+      ON CONFLICT(device_id, day, file_name) DO UPDATE SET image_hash=EXCLUDED.image_hash`, [device, day, file, hash]);
+    return reply.code(200).send({ ok: true });
+  });
 
   app.get('/api/v1/overview', async request => {
     const query = z.object({ date: dateSchema.optional() }).parse(request.query);
     return getOverview(pool, query.date);
+  });
+  app.get('/api/v1/daily-brief', async request => {
+    const query = z.object({ date: dateSchema.optional() }).parse(request.query);
+    return getDailyBrief(pool, query.date);
+  });
+  app.get('/api/v1/daily-briefs/:device/:day/images/:file', async (request, reply) => {
+    const { device, day, file } = briefImageParams.parse(request.params);
+    const hash = await getDailyBriefImageHash(pool, device, day, file);
+    if (!hash) throw failure(404, '简报图片尚未同步');
+    try { return reply.type('image/jpeg').header('Cache-Control', 'private, max-age=300').send(await readFile(path.join(config.storageDir, `${hash}.jpg`))); }
+    catch { throw failure(404, '简报图片不可用'); }
+  });
+  app.get('/api/v1/integrations/lobehub', async () => getLobehubSettings(pool));
+  app.put('/api/v1/integrations/lobehub', async request => {
+    const input = lobehubSettingsInput.parse(request.body);
+    return saveLobehubSettings(pool, input);
   });
   app.get('/api/v1/activities', async request => {
     const query = z.object({ ...activityFilters, include_deleted: z.enum(['true', 'false']).default('false') }).parse(request.query);

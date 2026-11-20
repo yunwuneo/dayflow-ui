@@ -2,10 +2,12 @@ import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Activity as ActivityIcon, ArrowLeft, ArrowRight, CalendarDays, Check, ChevronLeft, ChevronRight,
   Clock3, Cloud, CloudOff, FileText, ImageOff, Layers3, LoaderCircle, LogOut, Maximize2,
-  Menu, Search, SlidersHorizontal, Sun, X, RefreshCw, ShieldCheck, Monitor, BarChart3, AlertCircle } from 'lucide-react';
-import { api, Activity, Overview, screenshotURL } from './api';
+  Menu, Search, SlidersHorizontal, Sparkles, Sun, X, RefreshCw, ShieldCheck, Monitor, BarChart3, AlertCircle } from 'lucide-react';
+import { api, Activity, DailyBriefResponse, LobehubSettings, Overview, screenshotURL } from './api';
 import './style.css';
 import './casdoor.css';
+import { DailyBriefView } from './DailyBriefView';
+import { DEFAULT_LOBEHUB_SETTINGS, normalizeLobehubSettings } from './LobehubSettings';
 import { SyncSettings } from './SyncSettings';
 
 const duration = (minutes: number) => minutes >= 60 ? `${Math.floor(minutes / 60)}小时${Math.round(minutes % 60) ? ` ${Math.round(minutes % 60)}分` : ''}` : `${Math.round(minutes)}分钟`;
@@ -73,6 +75,9 @@ function CasdoorBind({ onSuccess }: { onSuccess: () => void }) {
 function Workspace({ onLogout }: { onLogout: () => Promise<void> }) {
   const [route, setRoute] = useState(routeFromURL);
   const [overview, setOverview] = useState<Overview | null>(null);
+  const [briefData, setBriefData] = useState<DailyBriefResponse | null>(null);
+  const [briefBusy, setBriefBusy] = useState(false);
+  const [lobehub, setLobehub] = useState<LobehubSettings>(DEFAULT_LOBEHUB_SETTINGS);
   const [items, setItems] = useState<Activity[]>([]); const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1); const [query, setQuery] = useState(''); const [search, setSearch] = useState('');
   const [category, setCategory] = useState(''); const [includeDeleted, setIncludeDeleted] = useState(true);
@@ -97,6 +102,22 @@ function Workspace({ onLogout }: { onLogout: () => Promise<void> }) {
     return () => controller.abort();
   }, [route.date, refresh]);
   useEffect(() => {
+    const controller = new AbortController();
+    api<LobehubSettings>('/integrations/lobehub', { signal: controller.signal }).then(val => setLobehub(normalizeLobehubSettings(val))).catch(() => {});
+    return () => controller.abort();
+  }, []);
+  useEffect(() => {
+    if (route.view !== 'brief') return;
+    const controller = new AbortController();
+    setBriefBusy(true);
+    setError('');
+    api<DailyBriefResponse>(`/daily-brief${route.date ? `?date=${route.date}` : ''}`, { signal: controller.signal })
+      .then(setBriefData)
+      .catch(e => { if (e.name !== 'AbortError') setError(e.message); })
+      .finally(() => { if (!controller.signal.aborted) setBriefBusy(false); });
+    return () => controller.abort();
+  }, [route.view, route.date, refresh]);
+  useEffect(() => {
     if (!date || !['timeline', 'search'].includes(route.view)) return;
     const controller = new AbortController(); setBusy(true); setError('');
     const params = new URLSearchParams({ page: String(page), limit: '30' });
@@ -119,7 +140,7 @@ function Workspace({ onLogout }: { onLogout: () => Promise<void> }) {
   const count = overview?.totals.reduce((sum, item) => sum + item.count, 0) || 0;
   const primaryDevice = overview?.devices[0];
   const fresh = primaryDevice && Date.now() - new Date(primaryDevice.last_sync_at).getTime() < 45 * 60 * 1000;
-  const title = route.view === 'search' ? '活动搜索' : route.view === 'status' ? '同步状态' : date ? dayLabel(date) : '时间线';
+  const title = route.view === 'search' ? '活动搜索' : route.view === 'status' ? '同步状态' : route.view === 'brief' ? (date ? `${dayLabel(date)} 简报` : '每日简报') : date ? dayLabel(date) : '时间线';
   return <div className="workspace">
     {sidebarOpen && <button className="sidebar-backdrop" aria-label="关闭导航" onClick={() => setSidebarOpen(false)} />}
     <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
@@ -127,24 +148,25 @@ function Workspace({ onLogout }: { onLogout: () => Promise<void> }) {
       <div className="nav-label">个人空间</div>
       <nav>
         <button className={['timeline', 'daily', 'weekly'].includes(route.view) ? 'active' : ''} onClick={() => navigate('timeline')}><CalendarDays size={18} />时间线</button>
+        <button className={route.view === 'brief' ? 'active' : ''} onClick={() => navigate('brief')}><Sparkles size={18} />每日简报{overview?.has_daily_brief && <span className="nav-badge" aria-label="今日已有简报" />}</button>
         <button className={route.view === 'search' ? 'active' : ''} onClick={() => navigate('search')}><Search size={18} />搜索活动</button>
         <button className={route.view === 'status' ? 'active' : ''} onClick={() => navigate('status')}><Cloud size={18} />同步状态</button>
       </nav>
-      <div className="sidebar-days"><div className="nav-label">最近记录</div>{overview?.available_days.slice(0, 7).map(day => <button className={day === date && route.view !== 'search' && route.view !== 'status' ? 'current' : ''} key={day} onClick={() => navigate('timeline', day)}><span>{dayLabel(day)}</span><span>{day === overview.today ? '今天' : dayLabel(day, { weekday: 'short' })}</span></button>)}</div>
+      <div className="sidebar-days"><div className="nav-label">最近记录</div>{overview?.available_days.slice(0, 7).map(day => <button className={day === date && !['search', 'status'].includes(route.view) ? 'current' : ''} key={day} onClick={() => navigate(route.view === 'brief' ? 'brief' : 'timeline', day)}><span>{dayLabel(day)}</span><span>{day === overview.today ? '今天' : dayLabel(day, { weekday: 'short' })}</span></button>)}</div>
       <div className="sidebar-bottom"><button className="device-link" onClick={() => navigate('status')}><span className={`status-dot ${fresh ? 'good' : ''}`} /><span>{primaryDevice ? 'Mac 已连接' : '等待首次同步'}<small>{primaryDevice ? `最近同步 ${time(primaryDevice.last_sync_at)}` : '尚无设备'}</small></span></button>
         <div className="account"><span className="avatar">N</span><span>个人档案<small>私有空间</small></span><IconButton label="退出登录" onClick={() => onLogout().catch(e => setError(e.message))}><LogOut size={17} /></IconButton></div>
       </div>
     </aside>
     <main className="main">
-      <header className="topbar"><div className="breadcrumb"><IconButton className="mobile-menu" label="打开导航" onClick={() => setSidebarOpen(true)}><Menu size={19} /></IconButton><span>我的档案</span><ChevronRight size={14} /><strong>{route.view === 'search' ? '搜索' : route.view === 'status' ? '同步状态' : '时间线'}</strong></div>
-        <div className="topbar-actions"><span className="private-label"><ShieldCheck size={14} />仅自己可见</span><IconButton label="刷新数据" onClick={() => setRefresh(r => r + 1)} disabled={busy}><RefreshCw size={17} className={busy ? 'spin' : ''} /></IconButton></div></header>
+      <header className="topbar"><div className="breadcrumb"><IconButton className="mobile-menu" label="打开导航" onClick={() => setSidebarOpen(true)}><Menu size={19} /></IconButton><span>我的档案</span><ChevronRight size={14} /><strong>{route.view === 'search' ? '搜索' : route.view === 'status' ? '同步状态' : route.view === 'brief' ? '每日简报' : '时间线'}</strong></div>
+        <div className="topbar-actions"><span className="private-label"><ShieldCheck size={14} />仅自己可见</span><IconButton label="刷新数据" onClick={() => setRefresh(r => r + 1)} disabled={busy || briefBusy}><RefreshCw size={17} className={busy || briefBusy ? 'spin' : ''} /></IconButton></div></header>
       <div className={`content ${selected ? 'with-detail' : ''}`}>
         <section className="primary-content">
-          <div className="page-heading"><div><div className="eyebrow">{route.view === 'search' ? '历史记录' : route.view === 'status' ? '设备与数据' : date ? `${dayLabel(date, { year: 'numeric' })} · ${dayLabel(date, { weekday: 'long' })}` : '活动记录'}</div><h1>{title}{date === overview?.today && ['timeline', 'daily', 'weekly'].includes(route.view) && <span className="today-label">今天</span>}</h1></div>
+          <div className="page-heading"><div><div className="eyebrow">{route.view === 'search' ? '历史记录' : route.view === 'status' ? '设备与数据' : route.view === 'brief' ? '每日简报 · Daily Brief' : date ? `${dayLabel(date, { year: 'numeric' })} · ${dayLabel(date, { weekday: 'long' })}` : '活动记录'}</div><h1>{title}{date === overview?.today && ['timeline', 'daily', 'weekly', 'brief'].includes(route.view) && <span className="today-label">今天</span>}</h1></div>
             {!['search', 'status'].includes(route.view) && date && <div className="date-controls"><IconButton label="前一天" onClick={() => navigate(route.view, shiftDate(date, -1))}><ChevronLeft size={18} /></IconButton><label className="date-picker"><CalendarDays size={16} /><input aria-label="选择日期" type="date" value={date} max={overview?.today} onChange={e => { if (e.target.value) navigate(route.view, e.target.value); }} /></label><IconButton label="后一天" disabled={date >= (overview?.today || date)} onClick={() => navigate(route.view, shiftDate(date, 1))}><ChevronRight size={18} /></IconButton></div>}
           </div>
           {error && <div className="error-banner" role="alert"><AlertCircle size={17} /><span>{error}</span><button onClick={() => setRefresh(r => r + 1)}>重试</button></div>}
-          {!['search', 'status'].includes(route.view) && <>
+          {!['search', 'status', 'brief'].includes(route.view) && <>
             <div className="metrics"><div><span><Clock3 size={15} />记录时长</span><strong>{duration(totalMinutes)}</strong></div><div><span><Layers3 size={15} />活动记录</span><strong>{count}<small>条</small></strong></div><div><span><ActivityIcon size={15} />活动分类</span><strong>{overview?.totals.length || 0}<small>类</small></strong></div></div>
             {totalMinutes > 0 && <div className="day-distribution" aria-label="当天分类时间分布">{overview?.totals.map(item => <div key={item.category} style={{ width: `${item.minutes / totalMinutes * 100}%`, background: color(item.category) }} title={`${item.category} · ${duration(item.minutes)}`} />)}</div>}
             <div className="tabs" role="tablist" aria-label="记录视图">{[['timeline', '时间线', CalendarDays], ['daily', '日报', FileText], ['weekly', '周统计', BarChart3]].map(([key, label, Icon]) => { const I = Icon as typeof CalendarDays; return <button key={key as string} role="tab" aria-selected={route.view === key} className={route.view === key ? 'active' : ''} onClick={() => navigate(key as string)}><I size={16} />{label as string}</button>; })}</div>
@@ -160,9 +182,19 @@ function Workspace({ onLogout }: { onLogout: () => Promise<void> }) {
             </button>)}</div>}
             {total > 30 && <div className="pagination"><span>共 {total} 条 · 第 {page} / {Math.ceil(total / 30)} 页</span><IconButton label="上一页" disabled={page === 1 || busy} onClick={() => { setPage(p => p - 1); setSelected(null); }}><ChevronLeft size={17} /></IconButton><IconButton label="下一页" disabled={page * 30 >= total || busy} onClick={() => { setPage(p => p + 1); setSelected(null); }}><ChevronRight size={17} /></IconButton></div>}
           </>}
+          {route.view === 'brief' && (
+            <DailyBriefView
+              data={briefData}
+              loading={briefBusy}
+              lobehub={lobehub}
+              onLobehubSaved={setLobehub}
+              onSelectDate={nextDay => navigate('brief', nextDay)}
+              zone={zone}
+            />
+          )}
           {route.view === 'daily' && <Daily data={overview?.daily || null} />}
           {route.view === 'weekly' && <Weekly data={overview?.weekly || null} color={color} />}
-          {route.view === 'status' && <><SyncSettings /><Status overview={overview} /></>}
+          {route.view === 'status' && <><SyncSettings lobehub={lobehub} onLobehubSaved={setLobehub} /><Status overview={overview} /></>}
         </section>
         {selected && <aside className="detail" aria-label="活动详情"><div className="detail-header"><span>活动详情</span><IconButton label="关闭详情" onClick={() => setSelected(null)}><X size={18} /></IconButton></div><div className="detail-content"><div className="detail-category"><span className="category-dot" style={{ background: color(selected.category) }} />{selected.category}{selected.source_deleted && <span className="archived-tag">源端已删除</span>}</div><h2>{selected.title}</h2><div className="detail-time"><CalendarDays size={14} />{dayLabel(selected.day)}<span>{time(selected.start)} – {time(selected.end)}</span></div><div className="detail-duration"><Clock3 size={14} />{duration(selected.duration_minutes)}</div>
           <button className="screenshot-button" disabled={!selected.has_screenshot} onClick={() => setImageOpen(true)} aria-label="放大截图"><Screenshot key={`${selected.device_id}-${selected.record_id}`} item={selected} className="detail-screenshot" />{selected.has_screenshot && <span><Maximize2 size={16} /></span>}</button>

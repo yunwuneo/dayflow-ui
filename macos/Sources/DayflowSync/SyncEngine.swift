@@ -16,7 +16,24 @@ struct SyncReport: Codable {
     var uploadedScreenshots = 0
     var missingScreenshots = 0
     var changedDays = 0
+    var changedBriefs = 0
+    var uploadedBriefImages = 0
     var revision = 0
+    enum CodingKeys: String, CodingKey {
+        case completedAt, changedActivities, uploadedScreenshots, missingScreenshots, changedDays, changedBriefs, uploadedBriefImages, revision
+    }
+    init() {}
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt) ?? completedAt
+        changedActivities = try container.decodeIfPresent(Int.self, forKey: .changedActivities) ?? 0
+        uploadedScreenshots = try container.decodeIfPresent(Int.self, forKey: .uploadedScreenshots) ?? 0
+        missingScreenshots = try container.decodeIfPresent(Int.self, forKey: .missingScreenshots) ?? 0
+        changedDays = try container.decodeIfPresent(Int.self, forKey: .changedDays) ?? 0
+        changedBriefs = try container.decodeIfPresent(Int.self, forKey: .changedBriefs) ?? 0
+        uploadedBriefImages = try container.decodeIfPresent(Int.self, forKey: .uploadedBriefImages) ?? 0
+        revision = try container.decodeIfPresent(Int.self, forKey: .revision) ?? 0
+    }
 }
 
 actor SyncEngine {
@@ -88,9 +105,14 @@ actor SyncEngine {
         }
         var remoteActivities: [Int: JSON] = [:]
         for item in manifest["activities"] as? [JSON] ?? [] { if let id = item["record_id"] as? Int { remoteActivities[id] = item } }
+        var remoteBriefs: [String: String] = [:]
+        for item in manifest["daily_briefs"] as? [JSON] ?? [] {
+            if let day = item["day"] as? String, let hash = item["source_hash"] as? String { remoteBriefs[day] = hash }
+        }
         progress("读取 Dayflow 活动与日期索引")
         let database = try SourceDatabase(path: settings.databasePath)
         let snapshot = try database.snapshot()
+        let localBriefs = try DailyBriefSource.scan(directory: settings.dailyBriefDirectory)
         guard let status = try dayflow(settings, ["status"]), let categoriesResponse = try dayflow(settings, ["categories"]),
               let categories = categoriesResponse["categories"] as? [JSON], let zone = status["time_zone"] as? String,
               let boundary = status["day_boundary_hour"] as? Int else { throw SyncFailure("Dayflow 状态或分类数据不完整") }
@@ -109,8 +131,9 @@ actor SyncEngine {
             ])
         }
         let changedWeeks = weeks.filter { weekHashes[$0] != remoteWeeks[$0] }
+        let changedBriefs = localBriefs.filter { remoteBriefs[$0.day] != $0.sourceHash }
         var report = SyncReport()
-        var batchDays: [JSON] = []; var batchDailies: [JSON] = []; var batchWeeks: [JSON] = []
+        var batchDays: [JSON] = []; var batchDailies: [JSON] = []; var batchWeeks: [JSON] = []; var batchBriefs: [JSON] = []
         let categoriesHash = try fingerprint(categories)
 
         func sendBatch() async throws {
@@ -138,7 +161,7 @@ actor SyncEngine {
             let body: JSON = ["device_id": settings.deviceID, "device_name": settings.deviceName,
                               "batch_id": UUID().uuidString.lowercased(), "expected_revision": revision,
                               "time_zone": zone, "day_boundary_hour": boundary, "status": status,
-                              "categories": categories, "days": batchDays, "dailies": batchDailies, "weeks": batchWeeks]
+                              "categories": categories, "days": batchDays, "dailies": batchDailies, "weeks": batchWeeks, "daily_briefs": batchBriefs]
             let data = try encodeJSON(body)
             guard data.count < 15 * 1024 * 1024 else { throw SyncFailure("同步批次超过 15 MB，请联系维护者拆分该日期") }
             try data.write(to: pendingURL, options: .atomic)
@@ -148,7 +171,8 @@ actor SyncEngine {
             revision = confirmedRevision
             try FileManager.default.removeItem(at: pendingURL)
             report.changedDays += batchDays.count
-            batchDays = []; batchDailies = []; batchWeeks = []
+            report.changedBriefs += batchBriefs.count
+            batchDays = []; batchDailies = []; batchWeeks = []; batchBriefs = []
         }
 
         for (index, date) in changedDays.enumerated() {
@@ -180,9 +204,34 @@ actor SyncEngine {
             batchWeeks.append(["date": week, "source_hash": weekHashes[week]!, "document": doc as Any? ?? NSNull()])
             if batchWeeks.count >= 7 { try await sendBatch() }
         }
+        for brief in changedBriefs {
+            batchBriefs.append(brief.batchPayload)
+            if batchBriefs.count >= 7 { try await sendBatch() }
+        }
         progress("提交活动、日报与采集状态")
         try await sendBatch()
         let updated = try await request("sync/state?device_id=\(settings.deviceID)")
+        var uploadedBriefImages: [String: Set<String>] = [:]
+        for item in updated["daily_briefs"] as? [JSON] ?? [] {
+            guard let day = item["day"] as? String else { continue }
+            uploadedBriefImages[day] = Set(item["uploaded_images"] as? [String] ?? [])
+        }
+        var briefImageQueue: [(day: String, file: String, url: URL)] = []
+        for brief in localBriefs where uploadedBriefImages[brief.day] != nil {
+            let existing = uploadedBriefImages[brief.day] ?? []
+            for (file, fileURL) in brief.images.sorted(by: { $0.key < $1.key }) where !existing.contains(file) {
+                briefImageQueue.append((day: brief.day, file: file, url: fileURL))
+            }
+        }
+        for (index, item) in briefImageQueue.enumerated() {
+            try Task.checkCancellation()
+            progress("同步每日简报图片（\(index + 1)/\(briefImageQueue.count)）")
+            guard let imageData = try? Data(contentsOf: item.url), !imageData.isEmpty else { continue }
+            let ext = item.url.pathExtension.lowercased()
+            let contentType = ext == "png" ? "image/png" : ext == "webp" ? "image/webp" : "image/jpeg"
+            _ = try await request("sync/daily-briefs/\(settings.deviceID)/\(item.day)/images/\(item.file)", method: "PUT", data: imageData, contentType: contentType)
+            report.uploadedBriefImages += 1
+        }
         let candidates = (updated["activities"] as? [JSON] ?? []).filter { item in
             guard let id = item["record_id"] as? Int else { return false }
             return snapshot.activeIDs.contains(id) && item["has_screenshot"] as? Bool != true

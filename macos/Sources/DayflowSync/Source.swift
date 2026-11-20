@@ -142,3 +142,90 @@ enum ScreenshotExtractor {
         return nil
     }
 }
+
+struct DailyBriefRecord {
+    let day: String
+    let sourceDay: String
+    let generatedAt: String
+    let sourceHash: String
+    let content: JSON
+    let userState: JSON
+    let stats: JSON?
+    let images: [String: URL]
+    var batchPayload: JSON {
+        var payload: JSON = [
+            "date": day,
+            "source_day": sourceDay,
+            "generated_at": generatedAt,
+            "source_hash": sourceHash,
+            "content": content,
+            "user_state": userState
+        ]
+        if let stats { payload["stats"] = stats }
+        return payload
+    }
+}
+
+enum DailyBriefSource {
+    private static let dayPattern = try! NSRegularExpression(pattern: #"^\d{4}-\d{2}-\d{2}$"#)
+    private static let filePattern = try! NSRegularExpression(pattern: #"^[a-zA-Z0-9][a-zA-Z0-9._-]*$"#)
+    private static let supportedImageExtensions: Set<String> = ["jpg", "jpeg", "png", "webp"]
+
+    static func scan(directory: String) throws -> [DailyBriefRecord] {
+        let trimmed = directory.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        let root = URL(fileURLWithPath: trimmed, isDirectory: true)
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDir), isDir.boolValue else { return [] }
+        let entries = (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
+        var records: [DailyBriefRecord] = []
+        for entry in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            let day = entry.lastPathComponent
+            let range = NSRange(day.startIndex..., in: day)
+            guard dayPattern.firstMatch(in: day, range: range) != nil,
+                  (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
+            let briefURL = entry.appendingPathComponent("brief.json")
+            guard FileManager.default.fileExists(atPath: briefURL.path),
+                  let data = try? Data(contentsOf: briefURL),
+                  let raw = try? parseJSON(data) else { continue }
+            let briefDay = (raw["day"] as? String) ?? day
+            guard briefDay == day else { continue }
+            let sourceDay = (raw["sourceDay"] as? String) ?? (raw["source_day"] as? String) ?? day
+            let generatedAt = normalizeTimestamp(raw["generatedAt"] ?? raw["generated_at"])
+            guard let content = raw["content"] as? JSON else { continue }
+            let userState = (raw["userState"] as? JSON) ?? (raw["user_state"] as? JSON) ?? [:]
+            let stats = raw["stats"] as? JSON
+            let sourceHash = try fingerprint(raw)
+            let images = scanImages(in: entry.appendingPathComponent("images", isDirectory: true))
+            records.append(DailyBriefRecord(day: day, sourceDay: sourceDay, generatedAt: generatedAt, sourceHash: sourceHash,
+                                            content: content, userState: userState, stats: stats, images: images))
+        }
+        return records
+    }
+
+    private static func scanImages(in directory: URL) -> [String: URL] {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDir), isDir.boolValue else { return [:] }
+        let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])) ?? []
+        var images: [String: URL] = [:]
+        for file in files {
+            let name = file.lastPathComponent
+            let range = NSRange(name.startIndex..., in: name)
+            guard !name.contains(".."),
+                  filePattern.firstMatch(in: name, range: range) != nil,
+                  supportedImageExtensions.contains(file.pathExtension.lowercased()),
+                  (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
+            images[name] = file
+        }
+        return images
+    }
+
+    private static func normalizeTimestamp(_ value: Any?) -> String {
+        if let text = value as? String, !text.isEmpty { return text }
+        if let seconds = value as? Double {
+            let formatter = ISO8601DateFormatter()
+            return formatter.string(from: Date(timeIntervalSince1970: seconds))
+        }
+        return ISO8601DateFormatter().string(from: Date())
+    }
+}

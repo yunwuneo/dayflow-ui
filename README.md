@@ -12,6 +12,7 @@
 - 源端删除后，云端保留已上传的内容和截图。默认时间线和时长统计排除该记录，搜索可勾选包含源端已删除。
 - 截图从活动时间范围内选取最接近中点的可用视频帧，以 JPEG 保存；只保留首次成功上传的一张。源媒体缺失时显示暂无截图，后续同步继续补齐。
 - 时间线、详情、截图放大、分类筛选、中文全文子串搜索、分页、原始日报及周统计、设备状态。
+- 每日简报（Daily Brief）只读同步与展示：从本机 `~/Library/Application Support/Dayflow/daily_brief/` 增量同步历史及当日 `brief.json` 与配图，在 Web UI 还原「Take these off your plate」（Card / List 切换、Prompt 展开复制）和「Related to your interests」等板块，并支持配置自部署 LobeHub 地址与特定助理，一键跳转派发任务。
 - macOS 原生菜单栏：进度、最近同步、下一次同步、立即同步、暂停、设置、开机启动。
 - 单用户密码登录，HttpOnly 会话 Cookie；独立的同步令牌和可选只读 API 令牌。截图需要鉴权。
 
@@ -92,7 +93,9 @@ DayflowSync --sync-once --config /path/to/settings.json --state-dir /path/to/sta
 
 配置格式见 `macos/Sources/DayflowSync/Support.swift` 中的 `Settings`，本地示例由 `npm run sync:local` 生成。保留同一设备 ID；更换 ID 会被视为另一台设备。
 
-## iOS 客户端
+## iOS 客户端（暂停维护）
+
+> 当前版本暂时标记为**暂停维护**：新增的「每日简报（Daily Brief）」与 LobeHub 助理跳转能力尚未接入 iOS 端。
 
 用 Xcode 26+ 打开 `ios/Dayflow.xcodeproj`，选择 `Dayflow` Scheme，在 iOS / iPadOS 26+ 模拟器或真机运行。输入服务器地址，使用与 Web UI 相同的账号密码或只读 `READ_API_TOKEN` 登录。
 
@@ -158,9 +161,13 @@ docker compose --env-file .env.production exec -T app tar -C /app/storage -czf -
 | `GET /activities` | `date` / `from` / `to` / `q` / `category` / `include_deleted` / `page` / `limit` |
 | `GET /activities/:device/:record` | 完整活动 |
 | `GET /activities/:device/:record/screenshot` | 受保护的 JPEG |
-| `GET /sync/state?device_id=UUID` | 已确认版本、日期指纹、活动内容指纹、截图状态 |
-| `POST /sync/batch` | 事务性增量提交，结构见 `server/contracts.ts` |
+| `GET /sync/state?device_id=UUID` | 已确认版本、日期指纹、活动内容指纹、截图与每日简报状态 |
+| `POST /sync/batch` | 事务性增量提交（含 `daily_briefs`），结构见 `server/contracts.ts` |
 | `PUT /sync/activities/:device/:record/screenshot` | `Content-Type: image/jpeg`，最大 3 MB |
+| `PUT /sync/daily-briefs/:device/:day/images/:file` | 每日简报配图上传（JPEG/PNG/WebP），最大 5 MB |
+| `GET /daily-brief?date=YYYY-MM-DD` | 每日简报内容、状态与可用日期列表 |
+| `GET /daily-briefs/:device/:day/images/:file` | 受保护的每日简报配图 |
+| `GET / PUT /integrations/lobehub` | 读取/保存 LobeHub 跳转地址、模式与特定助理列表 |
 
 API 日期与时间按照源设备时区和 Dayflow 的日界线处理；默认凌晨 4 点。日报和周统计展示 Dayflow 自己生成的数据，因此可能比刚产生的活动晚。搜索在标题、摘要、详细记录和应用字段中进行，支持中文与普通子串，不依赖英语分词。
 
@@ -177,6 +184,8 @@ Casdoor 登录通过 `CASDOOR_ORIGIN`、`CASDOOR_CLIENT_ID`、`CASDOOR_CLIENT_SE
 | `get_activity` | 单条活动完整内容 |
 | `get_screenshot` | 活动截图，以图片内容返回 |
 | `summarize_time` | 日期范围内按天或按分类汇总时长，最多 366 天 |
+| `list_daily_briefs` | 列出已归档每日简报的日期、板块及 Docket 状态统计 |
+| `get_daily_brief` | 读取指定日期每日简报（支持按板块过滤与状态开关） |
 
 ```sh
 claude mcp add --transport http dayflow https://dayflow.example.com/mcp \

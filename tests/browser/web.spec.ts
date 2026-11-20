@@ -27,6 +27,28 @@ test('browse fictional timelines, screenshots, daily, weekly, search and logout'
   await expect(page.getByRole('heading', { name: '本周时间分配' })).toBeVisible();
   await page.screenshot({ path: info.outputPath('weekly.png'), fullPage: false });
   if (info.project.name === 'mobile') await page.getByRole('button', { name: '打开导航' }).click();
+  await page.getByRole('button', { name: '每日简报' }).click();
+  await page.getByLabel('选择日期').fill('2026-09-16');
+  await expect(page.getByRole('heading', { name: 'Take these off your plate' })).toBeVisible();
+  await expect(page.getByText('虚构设备离线排查')).toBeVisible();
+  await expect(page.getByText('Related to your interests')).toBeVisible();
+  await expect.poll(() => page.locator('.brief-reading-visual img').evaluateAll(elements => elements.filter(element => element instanceof HTMLImageElement && element.complete && element.naturalWidth > 0).length)).toBeGreaterThan(0);
+  await page.getByRole('button', { name: '虚构设备离线排查' }).click();
+  await expect(page.locator('.docket-expanded pre')).toContainText('请帮我检查虚构节点昨天的离线原因并输出修复步骤');
+  await page.getByRole('button', { name: 'Card', exact: true }).click();
+  await expect(page.getByText('任务 1 / 2')).toBeVisible();
+  await page.getByRole('button', { name: 'List', exact: true }).click();
+  await page.getByRole('button', { name: '设置 LobeHub 助理' }).click();
+  if (!(await page.locator('.lobehub-assistant-list').getByText('agt_ops_test').isVisible().catch(() => false))) {
+    await page.getByLabel('助理显示名称').fill('测试运维');
+    await page.getByLabel('助理 ID 或 Slug').fill('agt_ops_test');
+    await page.getByRole('button', { name: '添加', exact: true }).click();
+  }
+  await page.getByRole('button', { name: '保存配置' }).click();
+  await expect(page.locator('.docket-lobehub-btn').first()).toHaveAttribute('href', /^https:\/\/chat\.neo7\.cn\/agent\/agt_ops_test\?message=/);
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: info.outputPath('daily-brief.png'), fullPage: false });
+  if (info.project.name === 'mobile') await page.getByRole('button', { name: '打开导航' }).click();
   await page.getByRole('button', { name: '搜索活动', exact: true }).click();
   await page.getByRole('textbox', { name: '搜索活动' }).fill('项目');
   await expect(page.locator('.activity-row').first()).toBeVisible();

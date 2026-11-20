@@ -7,7 +7,7 @@ import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/
 import { z } from 'zod';
 import type { Config } from './config.ts';
 import { date as dateSchema, identifier } from './contracts.ts';
-import { activityFilters, getActivity, getOverview, getScreenshotHash, searchActivities, summarizeTime } from './queries.ts';
+import { activityFilters, getActivity, getDailyBrief, getOverview, getScreenshotHash, listDailyBriefs, searchActivities, summarizeTime } from './queries.ts';
 
 const readOnly = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 const json = (data: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(data) }] });
@@ -19,7 +19,7 @@ const activityKey = {
 
 function buildServer(pool: Pool, config: Config) {
   const server = new McpServer({ name: 'dayflow', version: '1.0.0' }, {
-    instructions: 'Dayflow 个人活动档案（只读）。日期格式 YYYY-MM-DD，按设备时区及日界线划分。先用 get_overview 了解可用日期和分类，再用 search_activities 查找活动，需要完整内容时调用 get_activity。',
+    instructions: 'Dayflow 个人活动档案（只读）。日期格式 YYYY-MM-DD，按设备时区及日界线划分。先用 get_overview 了解可用日期和分类，再用 search_activities 查找活动，需要完整内容时调用 get_activity；可用 list_daily_briefs 和 get_daily_brief 读取每日简报（含待办 Docket 与 Agent Prompt）。',
   });
   server.registerTool('get_overview', {
     title: '每日概览',
@@ -68,6 +68,48 @@ function buildServer(pool: Pool, config: Config) {
     if (span < 0) return problem('to 不能早于 from');
     if (span > 365) return problem('日期范围不能超过 366 天');
     return json(await summarizeTime(pool, from, to, group_by));
+  });
+  server.registerTool('list_daily_briefs', {
+    title: '每日简报列表',
+    description: '列出已同步的每日简报摘要（日期、来源日期、包含板块、Docket 任务数及各状态统计）。',
+    inputSchema: {
+      from: dateSchema.optional(),
+      to: dateSchema.optional(),
+      limit: z.coerce.number().int().min(1).max(90).default(30),
+    },
+    annotations: readOnly,
+  }, async ({ from, to, limit }) => {
+    if (from && to && Date.parse(to) < Date.parse(from)) return problem('to 不能早于 from');
+    return json({ briefs: await listDailyBriefs(pool, { from, to, limit }) });
+  });
+  server.registerTool('get_daily_brief', {
+    title: '每日简报详情',
+    description: '读取指定日期（省略 date 表示今天）的 Daily Brief，包含 Take these off your plate（docket 与 Agent Prompt）、Related to your interests 等板块。',
+    inputSchema: {
+      date: dateSchema.optional(),
+      section: z.enum(['docket', 'related_reading', 'industry_news', 'completed_yesterday', 'team_decisions', 'keep_tracking']).optional()
+        .describe('可选，仅返回指定板块以节省上下文'),
+      include_user_state: z.boolean().default(true).describe('是否包含原版客户端记录的 handoffs、Prompt 修改等状态'),
+    },
+    annotations: readOnly,
+  }, async ({ date, section, include_user_state }) => {
+    const result = await getDailyBrief(pool, date);
+    if (!result.brief) return json(result);
+    const brief = result.brief;
+    const content = section ? { order: Array.isArray(brief.content?.order) ? brief.content.order.filter((k: string) => k === section) : [section], [section]: brief.content?.[section] ?? null } : brief.content;
+    return json({
+      ...result,
+      brief: {
+        device_id: brief.device_id,
+        day: brief.day,
+        source_day: brief.source_day,
+        source: brief.source,
+        generated_at: brief.generated_at,
+        content,
+        ...(include_user_state ? { user_state: brief.user_state } : {}),
+        images: brief.images,
+      },
+    });
   });
   return server;
 }

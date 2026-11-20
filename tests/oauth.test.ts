@@ -217,7 +217,7 @@ test('OAuth authorization, persistence, scope separation and replay protection (
     assert.equal((await pool.query('SELECT count(*)::int AS n FROM mcp_oauth_tokens WHERE grant_id=(SELECT grant_id FROM mcp_oauth_codes WHERE code_hash=$1)', [digest(c.code)])).rows[0].n, 1);
   });
   let persistent: Record<string,string>;
-  await t.test('Tokens are resource-bound, read-only, opaque and functional for all five MCP tools', async () => {
+  await t.test('Tokens are resource-bound, read-only, opaque and functional for all seven MCP tools', async () => {
     const c = await code();
     assert.equal((await exchange(c, { resource: 'https://wrong.example/mcp' })).statusCode, 400);
     assert.equal((await exchange(c, { scope: 'dayflow:write' })).statusCode, 400);
@@ -227,7 +227,7 @@ test('OAuth authorization, persistence, scope separation and replay protection (
     assert.equal(persistent.resource, resource);
     assert.equal((await rpc(persistent.access_token, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'fictional', version: '1' } })).statusCode, 200);
     const tools = (await rpc(persistent.access_token)).json().result.tools;
-    assert.equal(tools.length, 5); assert.ok(tools.every((tool: any) => tool.annotations.readOnlyHint && tool.securitySchemes?.[0].scopes.includes('dayflow:read')));
+    assert.equal(tools.length, 7); assert.ok(tools.every((tool: any) => tool.annotations.readOnlyHint && tool.securitySchemes?.[0].scopes.includes('dayflow:read')));
     const device = randomUUID(); const day = '2026-01-01';
     const card = { record_id: 1, title: '虚构活动', category: '演示', start: `${day}T09:00:00Z`, end: `${day}T10:00:00Z`, summary: '虚构摘要', detailed_summary: '虚构详情', apps: ['Fictional App'], duration_minutes: 60 };
     const batch = { device_id: device, device_name: 'Fictional Mac', expected_revision: 0, batch_id: randomUUID(), time_zone: 'Asia/Shanghai', day_boundary_hour: 4, status: {}, categories: [],
@@ -236,7 +236,8 @@ test('OAuth authorization, persistence, scope separation and replay protection (
     const picture = await sharp({ create: { width: 32, height: 32, channels: 3, background: '#246c54' } }).jpeg().toBuffer();
     assert.equal((await app.inject({ method: 'PUT', url: `/api/v1/sync/activities/${device}/1/screenshot`, headers: { authorization: `Bearer ${config.syncToken}`, 'content-type': 'image/jpeg' }, payload: picture })).statusCode, 200);
     for (const [name, args] of [['get_overview', {}], ['search_activities', {}], ['get_activity', { device_id: device, record_id: 1 }],
-      ['get_screenshot', { device_id: device, record_id: 1 }], ['summarize_time', { from: '2026-01-01', to: '2026-01-01' }]] as const) {
+      ['get_screenshot', { device_id: device, record_id: 1 }], ['summarize_time', { from: '2026-01-01', to: '2026-01-01' }],
+      ['list_daily_briefs', {}], ['get_daily_brief', { date: day }]] as const) {
       const result = await rpc(persistent.access_token, 'tools/call', { name, arguments: args });
       assert.equal(result.statusCode, 200); assert.notEqual(result.json().result.isError, true);
       if (name === 'get_screenshot') assert.equal(result.json().result.content[0].type, 'image');

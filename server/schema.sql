@@ -43,3 +43,27 @@ CREATE TABLE IF NOT EXISTS sync_batches (
   revision integer NOT NULL, received_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY(device_id, batch_id)
 );
+CREATE TABLE IF NOT EXISTS daily_briefs (
+  device_id uuid NOT NULL REFERENCES devices(id), day date NOT NULL,
+  source_day date NOT NULL, source text NOT NULL DEFAULT 'local_sync',
+  source_hash text NOT NULL, generated_at timestamptz NOT NULL,
+  content jsonb NOT NULL, user_state jsonb NOT NULL DEFAULT '{}',
+  stats jsonb, updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (device_id, day)
+);
+CREATE INDEX IF NOT EXISTS daily_briefs_day ON daily_briefs(day DESC, updated_at DESC);
+CREATE TABLE IF NOT EXISTS daily_brief_images (
+  device_id uuid NOT NULL REFERENCES devices(id), day date NOT NULL,
+  file_name text NOT NULL, image_hash text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (device_id, day, file_name)
+);
+CREATE TABLE IF NOT EXISTS lobehub_settings (
+  id integer PRIMARY KEY CHECK (id=1),
+  base_url text NOT NULL DEFAULT 'https://chat.neo7.cn',
+  default_assistant_id text NOT NULL DEFAULT '',
+  handoff_mode text NOT NULL DEFAULT 'auto_send' CHECK (handoff_mode IN ('auto_send', 'copy_open')),
+  assistants jsonb NOT NULL DEFAULT '[]',
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO lobehub_settings(id) VALUES(1) ON CONFLICT DO NOTHING;

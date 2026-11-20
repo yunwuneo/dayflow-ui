@@ -156,7 +156,7 @@ test('Authenticated sync, reconciliation, archive and screenshot lifecycle', asy
     const init = await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } });
     assert.equal(init.statusCode, 200, init.body); assert.equal(init.json().result.serverInfo.name, 'dayflow');
     const tools = (await rpc('tools/list', {})).json().result.tools;
-    assert.deepEqual(tools.map((tool: any) => tool.name).sort(), ['get_activity', 'get_overview', 'get_screenshot', 'search_activities', 'summarize_time']);
+    assert.deepEqual(tools.map((tool: any) => tool.name).sort(), ['get_activity', 'get_daily_brief', 'get_overview', 'get_screenshot', 'list_daily_briefs', 'search_activities', 'summarize_time']);
     assert.ok(tools.every((tool: any) => tool.annotations.readOnlyHint));
     const overview = JSON.parse((await call('get_overview', { date: day })).content[0].text);
     assert.equal(overview.daily.highlights[0], '完成同步');
@@ -188,6 +188,97 @@ test('Authenticated sync, reconciliation, archive and screenshot lifecycle', asy
     assert.equal(found.total, 1);
     assert.equal((await app.inject({ url: '/api/v1/activities?date=2026-02-30', headers: readHeaders })).statusCode, 400);
     assert.equal((await app.inject({ url: '/api/v1/activities?page=-1', headers: readHeaders })).statusCode, 400);
+  });
+  await t.test('Daily brief sync, images, LobeHub settings and MCP read-only tools', async () => {
+    const briefDay = '2026-09-17';
+    const briefContent = {
+      order: ['docket', 'related_reading'],
+      docket: [{ title: '排查测试环境离线问题', detail: '昨天出现了连接中断', prompt: '请排查测试节点离线原因', agent: true }],
+      related_reading: [{ title: 'Working with repositories', source: 'restic docs', url: 'https://restic.readthedocs.io/', hook: 'restic 默认 check 不读全量数据', reason: '昨天对比了备份策略', minutes: 12, imageFile: 'images/link-restic.jpg', imageIsTitleCard: false }],
+    };
+    const briefUserState = { handoffs: [{ title: '排查测试环境离线问题', dismissed: false, agent: 'Claude', method: 'paste' }] };
+    const briefBatch = {
+      ...base,
+      batch_id: randomUUID(),
+      expected_revision: 3,
+      days: [],
+      dailies: [],
+      weeks: [],
+      daily_briefs: [{
+        date: briefDay,
+        source_day: day,
+        generated_at: `${briefDay}T04:10:00+08:00`,
+        source_hash: digest('brief-v1'),
+        content: briefContent,
+        user_state: briefUserState,
+        stats: { model: 'opus', durationSeconds: 42 },
+      }],
+    };
+    const synced = await app.inject({ method: 'POST', url: '/api/v1/sync/batch', headers: syncHeaders, payload: briefBatch });
+    assert.equal(synced.statusCode, 200, synced.body);
+
+    const state = (await app.inject({ url: `/api/v1/sync/state?device_id=${device}`, headers: syncHeaders })).json();
+    assert.equal(state.daily_briefs.length, 1);
+    assert.equal(state.daily_briefs[0].day, briefDay);
+    assert.deepEqual(state.daily_briefs[0].uploaded_images, []);
+
+    const badImg = await app.inject({ method: 'PUT', url: `/api/v1/sync/daily-briefs/${device}/${briefDay}/images/..bad.jpg`, headers: { ...syncHeaders, 'content-type': 'image/jpeg' }, payload: Buffer.from('x') });
+    assert.equal(badImg.statusCode, 400);
+
+    const imgBuf = await sharp({ create: { width: 40, height: 30, channels: 3, background: '#c9d6ff' } }).jpeg().toBuffer();
+    const putImg = await app.inject({ method: 'PUT', url: `/api/v1/sync/daily-briefs/${device}/${briefDay}/images/link-restic.jpg`, headers: { ...syncHeaders, 'content-type': 'image/jpeg' }, payload: imgBuf });
+    assert.equal(putImg.statusCode, 200, putImg.body);
+
+    const stateAfterImg = (await app.inject({ url: `/api/v1/sync/state?device_id=${device}`, headers: syncHeaders })).json();
+    assert.deepEqual(stateAfterImg.daily_briefs[0].uploaded_images, ['link-restic.jpg']);
+
+    const briefRes = await app.inject({ url: `/api/v1/daily-brief?date=${briefDay}`, headers: { cookie: session } });
+    assert.equal(briefRes.statusCode, 200);
+    assert.equal(briefRes.json().brief.content.docket[0].title, '排查测试环境离线问题');
+    assert.deepEqual(briefRes.json().brief.images, ['link-restic.jpg']);
+
+    const readImg = await app.inject({ url: `/api/v1/daily-briefs/${device}/${briefDay}/images/link-restic.jpg`, headers: { cookie: session } });
+    assert.equal(readImg.statusCode, 200);
+    assert.match(String(readImg.headers['content-type']), /image\/jpeg/);
+
+    // LobeHub settings validation and persistence
+    assert.equal((await app.inject({ url: '/api/v1/integrations/lobehub', headers: readHeaders })).statusCode, 401);
+    const defaultLobe = (await app.inject({ url: '/api/v1/integrations/lobehub', headers: { cookie: session } })).json();
+    assert.equal(defaultLobe.base_url, 'https://chat.neo7.cn');
+    const badLobe = await app.inject({
+      method: 'PUT', url: '/api/v1/integrations/lobehub',
+      headers: { cookie: session, 'x-dayflow-request': '1', origin: config.publicOrigin },
+      payload: { base_url: 'javascript:alert(1)', default_assistant_id: '', handoff_mode: 'auto_send', assistants: [] },
+    });
+    assert.equal(badLobe.statusCode, 400);
+    const savedLobe = await app.inject({
+      method: 'PUT', url: '/api/v1/integrations/lobehub',
+      headers: { cookie: session, 'x-dayflow-request': '1', origin: config.publicOrigin },
+      payload: {
+        base_url: 'https://chat.neo7.cn/',
+        default_assistant_id: 'ops',
+        handoff_mode: 'auto_send',
+        assistants: [{ id: 'ops', name: '运维助理', agent_id: 'agt_ops_1' }],
+      },
+    });
+    assert.equal(savedLobe.statusCode, 200, savedLobe.body);
+    assert.equal(savedLobe.json().base_url, 'https://chat.neo7.cn');
+    assert.equal(savedLobe.json().assistants[0].agent_id, 'agt_ops_1');
+
+    // MCP daily brief tools
+    const mcpHeaders = { ...readHeaders, accept: 'application/json, text/event-stream' };
+    const call = async (name: string, args: object) => (await app.inject({
+      method: 'POST', url: '/mcp', headers: mcpHeaders,
+      payload: { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name, arguments: args } },
+    })).json().result;
+    const listed = JSON.parse((await call('list_daily_briefs', { from: briefDay, to: briefDay })).content[0].text);
+    assert.equal(listed.briefs.length, 1);
+    assert.equal(listed.briefs[0].docket_count, 1);
+    assert.deepEqual(listed.briefs[0].docket_statuses, { in_progress: 1 });
+    const fetched = JSON.parse((await call('get_daily_brief', { date: briefDay, section: 'docket', include_user_state: false })).content[0].text);
+    assert.equal(fetched.brief.content.docket[0].prompt, '请排查测试节点离线原因');
+    assert.equal(fetched.brief.content.related_reading, undefined);
+    assert.equal(fetched.brief.user_state, undefined);
   });
   await t.test('Logout revokes the session', async () => {
     const response = await app.inject({ method: 'POST', url: '/api/v1/auth/logout', headers: { cookie: session, 'x-dayflow-request': '1' } });

@@ -92,7 +92,7 @@ struct SyncApplication: App {
                 Text(model.message).font(.callout).foregroundStyle(.secondary)
                 if let report = model.report {
                     LabeledContent("最近同步", value: report.completedAt.formatted(date: .abbreviated, time: .shortened)).font(.caption)
-                    Text("更新 \(report.changedActivities) 条活动 · 上传 \(report.uploadedScreenshots) 张截图").font(.caption).foregroundStyle(.secondary)
+                    Text("更新 \(report.changedActivities) 条活动 · 上传 \(report.uploadedScreenshots) 张截图" + (report.changedBriefs > 0 ? " · \(report.changedBriefs) 份简报" : "")).font(.caption).foregroundStyle(.secondary)
                 }
                 if !model.settings.paused, let next = model.nextSync, !model.syncing {
                     LabeledContent("下次同步", value: next.formatted(date: .omitted, time: .shortened)).font(.caption)
@@ -129,6 +129,7 @@ struct SettingsView: View {
             Section("本机 Dayflow") {
                 TextField("CLI 路径", text: $draft.cliPath)
                 TextField("数据库路径", text: $draft.databasePath)
+                TextField("每日简报目录", text: $draft.dailyBriefDirectory)
             }
             Section("同步") {
                 Stepper("每 \(draft.intervalMinutes) 分钟同步", value: $draft.intervalMinutes, in: 5...1440, step: 5)
@@ -169,7 +170,8 @@ enum Entrypoint {
                     print("客户端设置已保存，设备令牌已存入钥匙串")
                 } else if arguments.contains("--inspect") {
                     let snapshot = try SourceDatabase(path: settings.databasePath).snapshot()
-                    print(String(data: try encodeJSON(["active_activities": snapshot.activeIDs.count, "days": snapshot.days.keys.sorted(), "daily_count": snapshot.dailyHashes.count]), encoding: .utf8)!)
+                    let briefs = try DailyBriefSource.scan(directory: settings.dailyBriefDirectory)
+                    print(String(data: try encodeJSON(["active_activities": snapshot.activeIDs.count, "days": snapshot.days.keys.sorted(), "daily_count": snapshot.dailyHashes.count, "daily_brief_count": briefs.count]), encoding: .utf8)!)
                 } else {
                     let token = try argument("--token-env").flatMap { ProcessInfo.processInfo.environment[$0] } ?? Keychain.read()
                     let directory = argument("--state-dir").map { URL(fileURLWithPath: $0) } ?? Settings.directory

@@ -57,4 +57,28 @@ final class SyncTests: XCTestCase {
             XCTAssertThrowsError(try settings.validatedURL(), address)
         }
     }
+    func testSettingsDecodesLegacyConfigWithoutDailyBriefDirectory() throws {
+        let legacy = #"{"serverURL":"https://example.com","deviceID":"11111111-1111-1111-1111-111111111111","deviceName":"Mac","cliPath":"/usr/local/bin/dayflow","databasePath":"/tmp/chunks.sqlite","intervalMinutes":30,"paused":false}"#
+        let decoded = try JSONDecoder().decode(Settings.self, from: Data(legacy.utf8))
+        XCTAssertEqual(decoded.dailyBriefDirectory, Settings.defaultDailyBriefDirectory)
+    }
+    func testDailyBriefSourceScansValidDaysAndImages() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("dayflow-brief-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dayDir = root.appendingPathComponent("2026-11-20", isDirectory: true)
+        let imagesDir = dayDir.appendingPathComponent("images", isDirectory: true)
+        let ignoredDir = root.appendingPathComponent("saved", isDirectory: true)
+        try FileManager.default.createDirectory(at: imagesDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: ignoredDir, withIntermediateDirectories: true)
+        let brief = #"{"day":"2026-11-20","sourceDay":"2026-11-19","generatedAt":"2026-11-20T04:05:00Z","content":{"order":["docket"],"docket":[{"title":"Task 1","prompt":"Do task 1","agent":true}]},"userState":{"handoffs":[]}}"#
+        try brief.write(to: dayDir.appendingPathComponent("brief.json"), atomically: true, encoding: .utf8)
+        try Data([0xFF, 0xD8, 0xFF]).write(to: imagesDir.appendingPathComponent("link-demo.jpg"))
+        try Data([0x00]).write(to: imagesDir.appendingPathComponent("ignored.txt"))
+
+        let scanned = try DailyBriefSource.scan(directory: root.path)
+        XCTAssertEqual(scanned.count, 1)
+        XCTAssertEqual(scanned[0].day, "2026-11-20")
+        XCTAssertEqual(scanned[0].sourceDay, "2026-11-19")
+        XCTAssertEqual(Array(scanned[0].images.keys), ["link-demo.jpg"])
+    }
 }

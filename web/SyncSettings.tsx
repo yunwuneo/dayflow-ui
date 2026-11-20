@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Cloud, ExternalLink, FileText, LoaderCircle, RefreshCw, ShieldCheck } from 'lucide-react';
-import { api } from './api';
+import { api, LobehubSettings } from './api';
+import { DEFAULT_LOBEHUB_SETTINGS, LobehubSettingsPanel, normalizeLobehubSettings } from './LobehubSettings';
 import { NotionSetup, type NotionSetupInfo } from './NotionSetup';
 import './sync-settings.css';
 
@@ -19,8 +20,16 @@ const resultMessages: Record<string, string> = {
   workspace_mismatch: '授权工作区与当前连接不同。请先断开当前连接，再更换工作区。',
 };
 
-export function SyncSettings() {
+export function SyncSettings({
+  lobehub,
+  onLobehubSaved,
+}: {
+  lobehub?: LobehubSettings;
+  onLobehubSaved?: (next: LobehubSettings) => void;
+} = {}) {
   const [status, setStatus] = useState<SyncStatus | null>(null);
+  const [localLobehub, setLocalLobehub] = useState<LobehubSettings>(normalizeLobehubSettings(lobehub));
+  const [lobehubLoaded, setLobehubLoaded] = useState(Boolean(lobehub));
   const [pages, setPages] = useState<Pages>({ pages: [], next_cursor: null });
   const [pageId, setPageId] = useState('');
   const [busy, setBusy] = useState(false); const [error, setError] = useState('');
@@ -35,6 +44,10 @@ export function SyncSettings() {
       if (current === version.current) { setStatus(value); setError(''); }
     } catch (e) { if ((e as Error).name !== 'AbortError' && current === version.current) setError((e as Error).message); }
   }, []);
+  useEffect(() => {
+    if (lobehub) { setLocalLobehub(normalizeLobehubSettings(lobehub)); setLobehubLoaded(true); return; }
+    api<LobehubSettings>('/integrations/lobehub').then(val => { setLocalLobehub(normalizeLobehubSettings(val)); setLobehubLoaded(true); }).catch(() => { setLocalLobehub(DEFAULT_LOBEHUB_SETTINGS); setLobehubLoaded(true); });
+  }, [lobehub]);
   useEffect(() => {
     const controller = new AbortController(); void refresh(controller.signal);
     const timer = setInterval(() => { if (!acting.current) void refresh(controller.signal); }, 10000);
@@ -129,6 +142,17 @@ export function SyncSettings() {
           </>}
         </>}
         <details className="sync-template"><summary>模板内容与同步范围</summary><p>「Dayflow · 活动与回顾」包含使用说明和同步记录数据库，可按类型、日期、设备、分类和时长筛选。活动以本地记录 ID 更新；源端删除会添加标记并保留记录。</p><p>单向同步到 Notion，不回写 Dayflow。记录正文与属性由同步管理，个人笔记请放在数据库之外。截图仅通过云端同步保存，不发送到 Notion。</p></details>
+      </section>
+      <section className="sync-card">
+        {lobehubLoaded ? (
+          <LobehubSettingsPanel
+            key={`${localLobehub.base_url}-${localLobehub.default_assistant_id}-${localLobehub.assistants.length}`}
+            settings={localLobehub}
+            onSaved={next => { setLocalLobehub(next); onLobehubSaved?.(next); }}
+          />
+        ) : (
+          <p aria-live="polite"><LoaderCircle className="spin" size={16} />正在读取 LobeHub 配置…</p>
+        )}
       </section>
     </>}
   </div>;
